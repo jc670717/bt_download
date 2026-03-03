@@ -363,6 +363,9 @@ def load_items_from_feed(url: str, max_pages: int = 1) -> tuple[List[TorrentItem
         max_pages = 1
 
     normalized_url = normalize_feed_url(url)
+    p = urllib.parse.urlparse(normalized_url)
+    if p.scheme and p.netloc and not p.path:
+        normalized_url = urllib.parse.urlunparse((p.scheme, p.netloc, "/", "", p.query, p.fragment))
     items: List[TorrentItem] = []
     visited: set[str] = set()
     page_count = 0
@@ -370,7 +373,13 @@ def load_items_from_feed(url: str, max_pages: int = 1) -> tuple[List[TorrentItem
 
     while current_url and page_count < max_pages and current_url not in visited:
         visited.add(current_url)
-        xml_text = fetch_xml(current_url)
+        try:
+            xml_text = fetch_xml(current_url)
+        except urllib.error.HTTPError:
+            # Keep already-collected pages instead of failing the whole load.
+            if page_count > 0:
+                break
+            raise
         if not looks_like_xml(xml_text):
             raise ValueError("URL did not return XML feed content.")
         if looks_like_html(xml_text):
@@ -396,6 +405,9 @@ def load_items_from_html(url: str, max_pages: int = 1) -> tuple[List[TorrentItem
         max_pages = 1
 
     normalized_url = url.strip()
+    p = urllib.parse.urlparse(normalized_url)
+    if p.scheme and p.netloc and not p.path:
+        normalized_url = urllib.parse.urlunparse((p.scheme, p.netloc, "/", "", p.query, p.fragment))
     items: List[TorrentItem] = []
     visited: set[str] = set()
     page_count = 0
@@ -403,7 +415,13 @@ def load_items_from_html(url: str, max_pages: int = 1) -> tuple[List[TorrentItem
 
     while current_url and page_count < max_pages and current_url not in visited:
         visited.add(current_url)
-        text = fetch_xml(current_url)
+        try:
+            text = fetch_xml(current_url)
+        except urllib.error.HTTPError:
+            # Keep already-collected pages instead of failing the whole load.
+            if page_count > 0:
+                break
+            raise
         if not looks_like_html(text):
             raise ValueError("URL did not return HTML listing content.")
 
