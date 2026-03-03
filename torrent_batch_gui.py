@@ -12,6 +12,7 @@ from torrent_batch_cli import (
     configure_network,
     download_file,
     item_history_key,
+    looks_like_feed_url,
     load_items_from_html,
     load_items_from_feed,
     load_download_history,
@@ -39,7 +40,6 @@ class App:
         self.out_var = tk.StringVar(value=os.path.abspath("/Users/leonchang/Library/CloudStorage/Dropbox/torrent"))
         self.limit_var = tk.StringVar(value="10000")
         self.pages_var = tk.StringVar(value="10")
-        self.mode_var = tk.StringVar(value="Auto")
         self.search_var = tk.StringVar(value="")
         self.proxy_var = tk.StringVar(value="")
         self.status_var = tk.StringVar(value="Ready")
@@ -54,8 +54,6 @@ class App:
         ttk.Label(top, text="Feed URL").grid(row=0, column=0, sticky="w")
         ttk.Entry(top, textvariable=self.url_var, width=95).grid(row=0, column=1, columnspan=4, sticky="ew", padx=(8, 8))
         ttk.Button(top, text="Load", command=self.load_feed).grid(row=0, column=5, sticky="ew")
-        mode_box = ttk.Combobox(top, textvariable=self.mode_var, values=["Auto", "Feed", "HTML"], width=8, state="readonly")
-        mode_box.grid(row=0, column=6, sticky="e", padx=(8, 0))
 
         ttk.Label(top, text="Output").grid(row=1, column=0, sticky="w", pady=(8, 0))
         ttk.Entry(top, textvariable=self.out_var, width=95).grid(row=1, column=1, columnspan=3, sticky="ew", padx=(8, 8), pady=(8, 0))
@@ -263,15 +261,15 @@ class App:
         self.current_limit = limit
         configure_network(proxy_url=(self.proxy_var.get().strip() or None))
         self.set_status("Loading feed...")
-        threading.Thread(target=self._load_feed_worker, args=(url, limit, pages, self.mode_var.get()), daemon=True).start()
+        threading.Thread(target=self._load_feed_worker, args=(url, limit, pages), daemon=True).start()
 
-    def _load_feed_worker(self, url: str, limit: int, pages: int, mode_text: str) -> None:
+    def _load_feed_worker(self, url: str, limit: int, pages: int) -> None:
         try:
-            mode = mode_text.strip().lower()
-            if mode == "feed":
-                items, pages_loaded, normalized = load_items_from_feed(url, pages)
-            elif mode == "html":
-                items, pages_loaded, normalized = load_items_from_html(url, pages)
+            if looks_like_feed_url(url):
+                try:
+                    items, pages_loaded, normalized = load_items_from_feed(url, pages)
+                except Exception:
+                    items, pages_loaded, normalized = load_items_from_html(url, pages)
             else:
                 try:
                     items, pages_loaded, normalized = load_items_from_html(url, pages)

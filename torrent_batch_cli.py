@@ -501,6 +501,15 @@ def load_items_from_html(url: str, max_pages: int = 1) -> tuple[List[TorrentItem
     return items, page_count, normalized_url
 
 
+def looks_like_feed_url(url: str) -> bool:
+    u = url.strip().lower()
+    if ".xml" in u or "rss" in u or "feed" in u:
+        return True
+    parsed = urllib.parse.urlparse(u)
+    q = urllib.parse.parse_qs(parsed.query)
+    return (q.get("page", [""])[0] or "") == "rss"
+
+
 def mark_downloaded(items: List[TorrentItem], out_dir: str, history_keys: Optional[set[str]] = None) -> None:
     keys = history_keys if history_keys is not None else load_download_history(out_dir)
     for it in items:
@@ -579,12 +588,6 @@ def run() -> int:
     parser.add_argument("--out", default="./downloads", help="Output directory")
     parser.add_argument("--limit", type=int, default=1000, help="Display first N items (default: 1000)")
     parser.add_argument("--pages", type=int, default=1, help="Follow rel=next for up to N pages (default: 1)")
-    parser.add_argument(
-        "--mode",
-        choices=["auto", "feed", "html"],
-        default="auto",
-        help="Input mode: auto-detect, feed(XML), or html listing (default: auto)",
-    )
     parser.add_argument("--insecure", action="store_true", help="Disable TLS certificate verification (not recommended)")
     parser.add_argument("--ca-bundle", default="", help="Custom CA bundle path for TLS verification")
     parser.add_argument("--proxy", default="", help="Proxy URL, e.g. http://127.0.0.1:7890")
@@ -593,10 +596,11 @@ def run() -> int:
     configure_network(proxy_url=(args.proxy.strip() or None))
 
     try:
-        if args.mode == "feed":
-            items, pages_loaded, normalized_url = load_items_from_feed(args.url, args.pages)
-        elif args.mode == "html":
-            items, pages_loaded, normalized_url = load_items_from_html(args.url, args.pages)
+        if looks_like_feed_url(args.url):
+            try:
+                items, pages_loaded, normalized_url = load_items_from_feed(args.url, args.pages)
+            except Exception:
+                items, pages_loaded, normalized_url = load_items_from_html(args.url, args.pages)
         else:
             try:
                 items, pages_loaded, normalized_url = load_items_from_html(args.url, args.pages)
