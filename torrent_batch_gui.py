@@ -5,13 +5,17 @@ import os
 import re
 import threading
 import tkinter as tk
+import urllib.error
 from tkinter import filedialog, messagebox, ttk
 
 from torrent_batch_cli import (
     TorrentItem,
     configure_network,
     download_file,
+    fetch_xml,
     item_history_key,
+    looks_like_html,
+    looks_like_xml,
     looks_like_feed_url,
     load_items_from_html,
     load_items_from_feed,
@@ -54,6 +58,7 @@ class App:
         ttk.Label(top, text="Feed URL").grid(row=0, column=0, sticky="w")
         ttk.Entry(top, textvariable=self.url_var, width=95).grid(row=0, column=1, columnspan=4, sticky="ew", padx=(8, 8))
         ttk.Button(top, text="Load", command=self.load_feed).grid(row=0, column=5, sticky="ew")
+        ttk.Button(top, text="Diagnose", command=self.diagnose_url).grid(row=0, column=6, sticky="ew", padx=(8, 0))
 
         ttk.Label(top, text="Output").grid(row=1, column=0, sticky="w", pady=(8, 0))
         ttk.Entry(top, textvariable=self.out_var, width=95).grid(row=1, column=1, columnspan=3, sticky="ew", padx=(8, 8), pady=(8, 0))
@@ -262,6 +267,31 @@ class App:
         configure_network(proxy_url=(self.proxy_var.get().strip() or None))
         self.set_status("Loading feed...")
         threading.Thread(target=self._load_feed_worker, args=(url, limit, pages), daemon=True).start()
+
+    def diagnose_url(self) -> None:
+        url = self.url_var.get().strip()
+        if not url:
+            messagebox.showerror("Error", "Please enter URL.")
+            return
+        configure_network(proxy_url=(self.proxy_var.get().strip() or None))
+        self.set_status("Diagnosing URL...")
+        threading.Thread(target=self._diagnose_worker, args=(url,), daemon=True).start()
+
+    def _diagnose_worker(self, url: str) -> None:
+        try:
+            text = fetch_xml(url, timeout=20, retries=1)
+            kind = "HTML" if looks_like_html(text) else ("XML" if looks_like_xml(text) else "Unknown")
+            hint = "Detected feed-like URL" if looks_like_feed_url(url) else "Detected web-page URL"
+            preview = text.lstrip()[:220].replace("\n", " ").replace("\r", " ")
+            msg = f"Reachable.\nType: {kind}\nHint: {hint}\nPreview: {preview}"
+            self.root.after(0, lambda: messagebox.showinfo("Diagnose", msg))
+            self.root.after(0, lambda: self.set_status("Diagnose done"))
+        except urllib.error.HTTPError as e:
+            self.root.after(0, lambda: messagebox.showerror("Diagnose", f"HTTP {e.code}: {e.reason}"))
+            self.root.after(0, lambda: self.set_status("Diagnose failed"))
+        except Exception as e:  # noqa: BLE001
+            self.root.after(0, lambda: messagebox.showerror("Diagnose", str(e)))
+            self.root.after(0, lambda: self.set_status("Diagnose failed"))
 
     def _load_feed_worker(self, url: str, limit: int, pages: int) -> None:
         try:
