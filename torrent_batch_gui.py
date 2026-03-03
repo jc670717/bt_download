@@ -10,7 +10,6 @@ from tkinter import filedialog, messagebox, ttk
 from torrent_batch_cli import (
     TorrentItem,
     configure_network,
-    configure_tls,
     download_file,
     item_history_key,
     load_items_from_html,
@@ -43,7 +42,6 @@ class App:
         self.mode_var = tk.StringVar(value="Auto")
         self.search_var = tk.StringVar(value="")
         self.proxy_var = tk.StringVar(value="")
-        self.verify_tls_var = tk.BooleanVar(value=True)
         self.status_var = tk.StringVar(value="Ready")
         self.progress_var = tk.DoubleVar(value=0.0)
 
@@ -58,7 +56,6 @@ class App:
         ttk.Button(top, text="Load", command=self.load_feed).grid(row=0, column=5, sticky="ew")
         mode_box = ttk.Combobox(top, textvariable=self.mode_var, values=["Auto", "Feed", "HTML"], width=8, state="readonly")
         mode_box.grid(row=0, column=6, sticky="e", padx=(8, 0))
-        ttk.Checkbutton(top, text="Verify TLS", variable=self.verify_tls_var).grid(row=0, column=7, sticky="e", padx=(8, 0))
 
         ttk.Label(top, text="Output").grid(row=1, column=0, sticky="w", pady=(8, 0))
         ttk.Entry(top, textvariable=self.out_var, width=95).grid(row=1, column=1, columnspan=3, sticky="ew", padx=(8, 8), pady=(8, 0))
@@ -80,7 +77,7 @@ class App:
         ttk.Label(top, text="Proxy").grid(row=3, column=0, sticky="w", pady=(8, 0))
         ttk.Entry(top, textvariable=self.proxy_var).grid(row=3, column=1, columnspan=4, sticky="ew", padx=(8, 8), pady=(8, 0))
 
-        for i in range(8):
+        for i in range(7):
             top.grid_columnconfigure(i, weight=1 if i in (1, 2, 3) else 0)
 
         mid = ttk.Frame(self.root, padding=(10, 0, 10, 0))
@@ -264,7 +261,6 @@ class App:
             return
 
         self.current_limit = limit
-        configure_tls(verify=self.verify_tls_var.get(), ca_bundle=None)
         configure_network(proxy_url=(self.proxy_var.get().strip() or None))
         self.set_status("Loading feed...")
         threading.Thread(target=self._load_feed_worker, args=(url, limit, pages, self.mode_var.get()), daemon=True).start()
@@ -313,7 +309,6 @@ class App:
 
         out_dir = self.out_var.get().strip() or "./downloads"
         os.makedirs(out_dir, exist_ok=True)
-        configure_tls(verify=self.verify_tls_var.get(), ca_bundle=None)
         configure_network(proxy_url=(self.proxy_var.get().strip() or None))
         if not self.history_keys:
             self.history_keys = load_download_history(out_dir)
