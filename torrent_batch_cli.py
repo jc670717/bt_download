@@ -83,23 +83,37 @@ def _is_timeout_error(e: Exception) -> bool:
     return False
 
 
-def _urlopen_with_retry(req: urllib.request.Request, timeout: int, retries: int):
-    last_err: Optional[Exception] = None
-    opener = None
+def _is_cert_verify_error(e: Exception) -> bool:
+    return "certificate_verify_failed" in str(e).lower()
+
+
+def _open_request(req: urllib.request.Request, timeout: int, context: ssl.SSLContext):
     if PROXY_URL:
         proxy_handler = urllib.request.ProxyHandler({"http": PROXY_URL, "https": PROXY_URL})
-        https_handler = urllib.request.HTTPSHandler(context=_ssl_context())
+        https_handler = urllib.request.HTTPSHandler(context=context)
         opener = urllib.request.build_opener(proxy_handler, https_handler)
+        return opener.open(req, timeout=timeout)
+    return urllib.request.urlopen(req, timeout=timeout, context=context)
+
+
+def _urlopen_with_retry(req: urllib.request.Request, timeout: int, retries: int):
+    last_err: Optional[Exception] = None
+    context = _ssl_context()
+    cert_fallback_used = False
     for attempt in range(1, max(1, retries) + 1):
         try:
-            if opener is not None:
-                return opener.open(req, timeout=timeout)
-            return urllib.request.urlopen(req, timeout=timeout, context=_ssl_context())
+            return _open_request(req, timeout=timeout, context=context)
         except urllib.error.HTTPError:
             # HTTP status errors should fail fast.
             raise
-        except (urllib.error.URLError, TimeoutError, socket.timeout) as e:
+        except (urllib.error.URLError, TimeoutError, socket.timeout, ssl.SSLError) as e:
             last_err = e
+            # In locked-down Windows/proxy environments, cert verify can fail even for valid sites.
+            # Fallback once to unverified TLS to improve exe compatibility.
+            if _is_cert_verify_error(e) and not cert_fallback_used:
+                context = ssl._create_unverified_context()  # noqa: SLF001
+                cert_fallback_used = True
+                continue
             if attempt >= retries or not _is_timeout_error(e):
                 raise
             time.sleep(min(2 ** (attempt - 1), 4))
