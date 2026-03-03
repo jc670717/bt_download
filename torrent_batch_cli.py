@@ -100,7 +100,10 @@ def _urlopen_with_retry(req: urllib.request.Request, timeout: int, retries: int)
     last_err: Optional[Exception] = None
     context = _ssl_context()
     cert_fallback_used = False
-    for attempt in range(1, max(1, retries) + 1):
+    timeout_attempt = 0
+    max_timeout_attempts = max(1, retries)
+
+    while True:
         try:
             return _open_request(req, timeout=timeout, context=context)
         except urllib.error.HTTPError:
@@ -114,9 +117,13 @@ def _urlopen_with_retry(req: urllib.request.Request, timeout: int, retries: int)
                 context = ssl._create_unverified_context()  # noqa: SLF001
                 cert_fallback_used = True
                 continue
-            if attempt >= retries or not _is_timeout_error(e):
+            if not _is_timeout_error(e):
                 raise
-            time.sleep(min(2 ** (attempt - 1), 4))
+
+            timeout_attempt += 1
+            if timeout_attempt >= max_timeout_attempts:
+                raise
+            time.sleep(min(2 ** (timeout_attempt - 1), 4))
     if last_err is not None:
         raise last_err
     raise TimeoutError("Request failed")
