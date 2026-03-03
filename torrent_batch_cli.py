@@ -18,7 +18,9 @@ import json
 import os
 import re
 import ssl
+import socket
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -31,6 +33,9 @@ from typing import Iterable, List, Optional
 DEFAULT_UA = "TorrentBatchCLI/1.0 (+https://example.invalid)"
 TLS_VERIFY = True
 TLS_CA_BUNDLE: Optional[str] = None
+PROXY_URL: Optional[str] = None
+DEFAULT_TIMEOUT = 45
+DEFAULT_RETRIES = 3
 
 
 @dataclass
@@ -53,12 +58,54 @@ def configure_tls(verify: bool = True, ca_bundle: Optional[str] = None) -> None:
     TLS_CA_BUNDLE = ca_bundle
 
 
+def configure_network(proxy_url: Optional[str] = None) -> None:
+    global PROXY_URL
+    PROXY_URL = proxy_url.strip() if proxy_url else None
+
+
 def _ssl_context() -> ssl.SSLContext:
     if not TLS_VERIFY:
         return ssl._create_unverified_context()  # noqa: SLF001
     if TLS_CA_BUNDLE:
         return ssl.create_default_context(cafile=TLS_CA_BUNDLE)
     return ssl.create_default_context()
+
+
+def _is_timeout_error(e: Exception) -> bool:
+    msg = str(e).lower()
+    if "timed out" in msg or "timeout" in msg:
+        return True
+    reason = getattr(e, "reason", None)
+    if isinstance(reason, TimeoutError | socket.timeout):
+        return True
+    if isinstance(e, TimeoutError | socket.timeout):
+        return True
+    return False
+
+
+def _urlopen_with_retry(req: urllib.request.Request, timeout: int, retries: int):
+    last_err: Optional[Exception] = None
+    opener = None
+    if PROXY_URL:
+        proxy_handler = urllib.request.ProxyHandler({"http": PROXY_URL, "https": PROXY_URL})
+        https_handler = urllib.request.HTTPSHandler(context=_ssl_context())
+        opener = urllib.request.build_opener(proxy_handler, https_handler)
+    for attempt in range(1, max(1, retries) + 1):
+        try:
+            if opener is not None:
+                return opener.open(req, timeout=timeout)
+            return urllib.request.urlopen(req, timeout=timeout, context=_ssl_context())
+        except urllib.error.HTTPError:
+            # HTTP status errors should fail fast.
+            raise
+        except (urllib.error.URLError, TimeoutError, socket.timeout) as e:
+            last_err = e
+            if attempt >= retries or not _is_timeout_error(e):
+                raise
+            time.sleep(min(2 ** (attempt - 1), 4))
+    if last_err is not None:
+        raise last_err
+    raise TimeoutError("Request failed")
 
 
 def item_history_key(item: TorrentItem) -> str:
@@ -94,7 +141,7 @@ def save_download_history(out_dir: str, keys: set[str]) -> None:
         json.dump(payload, f, ensure_ascii=False, indent=2)
 
 
-def fetch_xml(url: str, timeout: int = 20) -> str:
+def fetch_xml(url: str, timeout: int = DEFAULT_TIMEOUT, retries: int = DEFAULT_RETRIES) -> str:
     req = urllib.request.Request(
         url,
         headers={
@@ -102,7 +149,7 @@ def fetch_xml(url: str, timeout: int = 20) -> str:
             "Accept-Encoding": "gzip, deflate",
         },
     )
-    with urllib.request.urlopen(req, timeout=timeout, context=_ssl_context()) as resp:
+    with _urlopen_with_retry(req, timeout=timeout, retries=retries) as resp:
         content_type = resp.headers.get("Content-Type", "")
         content_encoding = resp.headers.get("Content-Encoding", "").lower()
         raw = resp.read()
@@ -506,9 +553,9 @@ def sanitize_filename(s: str) -> str:
     return s or "torrent"
 
 
-def download_file(url: str, output_path: str, timeout: int = 30) -> None:
+def download_file(url: str, output_path: str, timeout: int = DEFAULT_TIMEOUT, retries: int = DEFAULT_RETRIES) -> None:
     req = urllib.request.Request(url, headers={"User-Agent": DEFAULT_UA})
-    with urllib.request.urlopen(req, timeout=timeout, context=_ssl_context()) as resp, open(output_path, "wb") as f:
+    with _urlopen_with_retry(req, timeout=timeout, retries=retries) as resp, open(output_path, "wb") as f:
         f.write(resp.read())
 
 
@@ -526,8 +573,10 @@ def run() -> int:
     )
     parser.add_argument("--insecure", action="store_true", help="Disable TLS certificate verification (not recommended)")
     parser.add_argument("--ca-bundle", default="", help="Custom CA bundle path for TLS verification")
+    parser.add_argument("--proxy", default="", help="Proxy URL, e.g. http://127.0.0.1:7890")
     args = parser.parse_args()
     configure_tls(verify=not args.insecure, ca_bundle=(args.ca_bundle.strip() or None))
+    configure_network(proxy_url=(args.proxy.strip() or None))
 
     try:
         if args.mode == "feed":
