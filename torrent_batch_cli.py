@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import gzip
 import html
+import json
 import os
 import re
 import sys
@@ -41,6 +42,39 @@ class TorrentItem:
     torrent_url: str
     timestamp: int = 0
     downloaded: str = "No"
+
+
+def item_history_key(item: TorrentItem) -> str:
+    url = (item.torrent_url or "").strip()
+    if url:
+        return f"url:{url}"
+    return f"name:{item.name.strip().lower()}"
+
+
+def history_file_path(out_dir: str) -> str:
+    return os.path.join(out_dir, "download_history.json")
+
+
+def load_download_history(out_dir: str) -> set[str]:
+    path = history_file_path(out_dir)
+    if not os.path.exists(path):
+        return set()
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        items = payload.get("items", [])
+        if isinstance(items, list):
+            return {str(x) for x in items}
+    except Exception:  # noqa: BLE001
+        return set()
+    return set()
+
+
+def save_download_history(out_dir: str, keys: set[str]) -> None:
+    path = history_file_path(out_dir)
+    payload = {"version": 1, "items": sorted(keys)}
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
 
 
 def fetch_xml(url: str, timeout: int = 20) -> str:
@@ -371,10 +405,13 @@ def load_items_from_html(url: str, max_pages: int = 1) -> tuple[List[TorrentItem
     return items, page_count, normalized_url
 
 
-def mark_downloaded(items: List[TorrentItem], out_dir: str) -> None:
+def mark_downloaded(items: List[TorrentItem], out_dir: str, history_keys: Optional[set[str]] = None) -> None:
+    keys = history_keys if history_keys is not None else load_download_history(out_dir)
     for it in items:
         out_path = os.path.join(out_dir, sanitize_filename(it.name) + ".torrent")
-        it.downloaded = "Yes" if os.path.exists(out_path) else "No"
+        in_dir = os.path.exists(out_path)
+        in_history = item_history_key(it) in keys
+        it.downloaded = "Yes" if (in_dir or in_history) else "No"
 
 
 def format_table(items: List[TorrentItem]) -> str:
@@ -485,7 +522,8 @@ def run() -> int:
         return 0
 
     os.makedirs(args.out, exist_ok=True)
-    mark_downloaded(items, args.out)
+    history_keys = load_download_history(args.out)
+    mark_downloaded(items, args.out, history_keys)
     shown = items[: max(1, args.limit)]
     print(format_table(shown))
     print()
@@ -518,12 +556,14 @@ def run() -> int:
         try:
             download_file(it.torrent_url, out_path)
             it.downloaded = "Yes"
+            history_keys.add(item_history_key(it))
             ok += 1
             print(f"[ok] #{it.idx} {it.name}")
         except Exception as e:  # noqa: BLE001
             fail += 1
             print(f"[fail] #{it.idx} {it.name} -> {e}", file=sys.stderr)
 
+    save_download_history(args.out, history_keys)
     print(f"[done] success={ok}, failed={fail}")
     return 0 if fail == 0 else 1
 

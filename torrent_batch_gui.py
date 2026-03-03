@@ -10,9 +10,12 @@ from tkinter import filedialog, messagebox, ttk
 from torrent_batch_cli import (
     TorrentItem,
     download_file,
+    item_history_key,
     load_items_from_html,
     load_items_from_feed,
+    load_download_history,
     mark_downloaded,
+    save_download_history,
     sanitize_filename,
 )
 
@@ -29,6 +32,7 @@ class App:
         self.sort_col = "idx"
         self.sort_desc = False
         self.current_limit = 1000
+        self.history_keys: set[str] = set()
 
         self.url_var = tk.StringVar(value="https://sukebei.nyaa.si")
         self.out_var = tk.StringVar(value=os.path.abspath("/Users/leonchang/Library/CloudStorage/Dropbox/torrent"))
@@ -128,6 +132,10 @@ class App:
         folder = filedialog.askdirectory(initialdir=self.out_var.get() or os.getcwd())
         if folder:
             self.out_var.set(folder)
+            self.history_keys = load_download_history(folder)
+            if self.items:
+                mark_downloaded(self.items, folder, self.history_keys)
+                self.apply_filter_and_refresh()
 
     def clear_table(self) -> None:
         for iid in self.tree.get_children():
@@ -208,12 +216,7 @@ class App:
         shown = items[: max(1, limit)]
         for it in shown:
             iid = str(it.idx)
-            warn = (
-                self._to_size_bytes(it.size) > 3 * 1024**3
-                or self._to_int(it.seeders) == 0
-                or self._to_int(it.leechers) == 0
-                or self._to_int(it.downloads) == 0
-            )
+            warn = self._to_size_bytes(it.size) > 3 * 1024**3
             if it.downloaded == "Yes":
                 # Downloaded style has higher priority than warning style.
                 tags = ("downloaded",)
@@ -270,7 +273,9 @@ class App:
                     items, pages_loaded, normalized = load_items_from_feed(url, pages)
             if not items:
                 raise ValueError("No torrent items found in this feed.")
-            mark_downloaded(items, self.out_var.get().strip() or "./downloads")
+            out_dir = self.out_var.get().strip() or "./downloads"
+            self.history_keys = load_download_history(out_dir)
+            mark_downloaded(items, out_dir, self.history_keys)
             self.items = items
             self.root.after(0, self.apply_filter_and_refresh)
             status = f"Loaded {min(len(items), max(1, limit))} shown / {len(items)} total from {pages_loaded} page(s)"
@@ -298,6 +303,8 @@ class App:
 
         out_dir = self.out_var.get().strip() or "./downloads"
         os.makedirs(out_dir, exist_ok=True)
+        if not self.history_keys:
+            self.history_keys = load_download_history(out_dir)
         selected = [self.item_by_iid[iid] for iid in selected_iids if iid in self.item_by_iid]
         self.set_status(f"Downloading {len(selected)} item(s)...")
         self.set_progress(0)
@@ -318,6 +325,7 @@ class App:
             try:
                 download_file(it.torrent_url, out_path)
                 it.downloaded = "Yes"
+                self.history_keys.add(item_history_key(it))
                 ok += 1
             except Exception as e:  # noqa: BLE001
                 fail += 1
@@ -326,6 +334,7 @@ class App:
             self.root.after(0, lambda i=i, total=total: self.set_progress((i / total) * 100.0))
 
         msg = f"Done. success={ok}, failed={fail}"
+        save_download_history(out_dir, self.history_keys)
         self.root.after(0, self.apply_filter_and_refresh)
         self.root.after(0, lambda: self.set_status(msg))
         self.root.after(0, lambda: self.set_progress(100.0))
