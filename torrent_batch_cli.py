@@ -30,7 +30,11 @@ from dataclasses import dataclass
 from typing import Iterable, List, Optional
 
 
-DEFAULT_UA = "TorrentBatchCLI/1.0 (+https://example.invalid)"
+DEFAULT_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/131.0.0.0 Safari/537.36"
+)
 TLS_VERIFY = True
 TLS_CA_BUNDLE: Optional[str] = None
 PROXY_URL: Optional[str] = None
@@ -69,6 +73,14 @@ def _ssl_context() -> ssl.SSLContext:
     if TLS_CA_BUNDLE:
         return ssl.create_default_context(cafile=TLS_CA_BUNDLE)
     return ssl.create_default_context()
+
+
+def normalize_url(url: str) -> str:
+    u = url.strip()
+    p = urllib.parse.urlparse(u)
+    if p.scheme and p.netloc and not p.path:
+        return urllib.parse.urlunparse((p.scheme, p.netloc, "/", "", p.query, p.fragment))
+    return u
 
 
 def _is_timeout_error(e: Exception) -> bool:
@@ -163,11 +175,14 @@ def save_download_history(out_dir: str, keys: set[str]) -> None:
 
 
 def fetch_xml(url: str, timeout: int = DEFAULT_TIMEOUT, retries: int = DEFAULT_RETRIES) -> str:
+    url = normalize_url(url)
     req = urllib.request.Request(
         url,
         headers={
             "User-Agent": DEFAULT_UA,
             "Accept-Encoding": "gzip, deflate",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
         },
     )
     with _urlopen_with_retry(req, timeout=timeout, retries=retries) as resp:
@@ -430,10 +445,7 @@ def load_items_from_feed(url: str, max_pages: int = 1) -> tuple[List[TorrentItem
     if max_pages < 1:
         max_pages = 1
 
-    normalized_url = normalize_feed_url(url)
-    p = urllib.parse.urlparse(normalized_url)
-    if p.scheme and p.netloc and not p.path:
-        normalized_url = urllib.parse.urlunparse((p.scheme, p.netloc, "/", "", p.query, p.fragment))
+    normalized_url = normalize_url(normalize_feed_url(url))
     items: List[TorrentItem] = []
     visited: set[str] = set()
     page_count = 0
@@ -472,10 +484,7 @@ def load_items_from_html(url: str, max_pages: int = 1) -> tuple[List[TorrentItem
     if max_pages < 1:
         max_pages = 1
 
-    normalized_url = url.strip()
-    p = urllib.parse.urlparse(normalized_url)
-    if p.scheme and p.netloc and not p.path:
-        normalized_url = urllib.parse.urlunparse((p.scheme, p.netloc, "/", "", p.query, p.fragment))
+    normalized_url = normalize_url(url)
     items: List[TorrentItem] = []
     visited: set[str] = set()
     page_count = 0

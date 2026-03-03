@@ -21,6 +21,7 @@ from torrent_batch_cli import (
     load_items_from_feed,
     load_download_history,
     mark_downloaded,
+    normalize_url,
     save_download_history,
     sanitize_filename,
 )
@@ -279,11 +280,12 @@ class App:
 
     def _diagnose_worker(self, url: str) -> None:
         try:
-            text = fetch_xml(url, timeout=20, retries=1)
+            normalized = normalize_url(url)
+            text = fetch_xml(normalized, timeout=20, retries=1)
             kind = "HTML" if looks_like_html(text) else ("XML" if looks_like_xml(text) else "Unknown")
-            hint = "Detected feed-like URL" if looks_like_feed_url(url) else "Detected web-page URL"
+            hint = "Detected feed-like URL" if looks_like_feed_url(normalized) else "Detected web-page URL"
             preview = text.lstrip()[:220].replace("\n", " ").replace("\r", " ")
-            msg = f"Reachable.\nType: {kind}\nHint: {hint}\nPreview: {preview}"
+            msg = f"Reachable.\nURL: {normalized}\nType: {kind}\nHint: {hint}\nPreview: {preview}"
             self.root.after(0, lambda: messagebox.showinfo("Diagnose", msg))
             self.root.after(0, lambda: self.set_status("Diagnose done"))
         except urllib.error.HTTPError as e:
