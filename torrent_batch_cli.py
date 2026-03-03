@@ -17,6 +17,7 @@ import html
 import json
 import os
 import re
+import ssl
 import sys
 import urllib.error
 import urllib.parse
@@ -28,6 +29,8 @@ from typing import Iterable, List, Optional
 
 
 DEFAULT_UA = "TorrentBatchCLI/1.0 (+https://example.invalid)"
+TLS_VERIFY = True
+TLS_CA_BUNDLE: Optional[str] = None
 
 
 @dataclass
@@ -42,6 +45,20 @@ class TorrentItem:
     torrent_url: str
     timestamp: int = 0
     downloaded: str = "No"
+
+
+def configure_tls(verify: bool = True, ca_bundle: Optional[str] = None) -> None:
+    global TLS_VERIFY, TLS_CA_BUNDLE
+    TLS_VERIFY = verify
+    TLS_CA_BUNDLE = ca_bundle
+
+
+def _ssl_context() -> ssl.SSLContext:
+    if not TLS_VERIFY:
+        return ssl._create_unverified_context()  # noqa: SLF001
+    if TLS_CA_BUNDLE:
+        return ssl.create_default_context(cafile=TLS_CA_BUNDLE)
+    return ssl.create_default_context()
 
 
 def item_history_key(item: TorrentItem) -> str:
@@ -85,7 +102,7 @@ def fetch_xml(url: str, timeout: int = 20) -> str:
             "Accept-Encoding": "gzip, deflate",
         },
     )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with urllib.request.urlopen(req, timeout=timeout, context=_ssl_context()) as resp:
         content_type = resp.headers.get("Content-Type", "")
         content_encoding = resp.headers.get("Content-Encoding", "").lower()
         raw = resp.read()
@@ -473,7 +490,7 @@ def sanitize_filename(s: str) -> str:
 
 def download_file(url: str, output_path: str, timeout: int = 30) -> None:
     req = urllib.request.Request(url, headers={"User-Agent": DEFAULT_UA})
-    with urllib.request.urlopen(req, timeout=timeout) as resp, open(output_path, "wb") as f:
+    with urllib.request.urlopen(req, timeout=timeout, context=_ssl_context()) as resp, open(output_path, "wb") as f:
         f.write(resp.read())
 
 
@@ -489,7 +506,10 @@ def run() -> int:
         default="auto",
         help="Input mode: auto-detect, feed(XML), or html listing (default: auto)",
     )
+    parser.add_argument("--insecure", action="store_true", help="Disable TLS certificate verification (not recommended)")
+    parser.add_argument("--ca-bundle", default="", help="Custom CA bundle path for TLS verification")
     args = parser.parse_args()
+    configure_tls(verify=not args.insecure, ca_bundle=(args.ca_bundle.strip() or None))
 
     try:
         if args.mode == "feed":

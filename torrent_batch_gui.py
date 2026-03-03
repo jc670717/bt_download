@@ -9,6 +9,7 @@ from tkinter import filedialog, messagebox, ttk
 
 from torrent_batch_cli import (
     TorrentItem,
+    configure_tls,
     download_file,
     item_history_key,
     load_items_from_html,
@@ -40,6 +41,7 @@ class App:
         self.pages_var = tk.StringVar(value="10")
         self.mode_var = tk.StringVar(value="Auto")
         self.search_var = tk.StringVar(value="")
+        self.verify_tls_var = tk.BooleanVar(value=True)
         self.status_var = tk.StringVar(value="Ready")
         self.progress_var = tk.DoubleVar(value=0.0)
 
@@ -54,6 +56,7 @@ class App:
         ttk.Button(top, text="Load", command=self.load_feed).grid(row=0, column=5, sticky="ew")
         mode_box = ttk.Combobox(top, textvariable=self.mode_var, values=["Auto", "Feed", "HTML"], width=8, state="readonly")
         mode_box.grid(row=0, column=6, sticky="e", padx=(8, 0))
+        ttk.Checkbutton(top, text="Verify TLS", variable=self.verify_tls_var).grid(row=0, column=7, sticky="e", padx=(8, 0))
 
         ttk.Label(top, text="Output").grid(row=1, column=0, sticky="w", pady=(8, 0))
         ttk.Entry(top, textvariable=self.out_var, width=95).grid(row=1, column=1, columnspan=3, sticky="ew", padx=(8, 8), pady=(8, 0))
@@ -72,7 +75,7 @@ class App:
         search_entry.bind("<KeyRelease>", lambda _e: self.apply_filter_and_refresh())
         ttk.Button(top, text="Clear", command=self.clear_filter).grid(row=2, column=5, sticky="ew", pady=(8, 0))
 
-        for i in range(7):
+        for i in range(8):
             top.grid_columnconfigure(i, weight=1 if i in (1, 2, 3) else 0)
 
         mid = ttk.Frame(self.root, padding=(10, 0, 10, 0))
@@ -256,6 +259,7 @@ class App:
             return
 
         self.current_limit = limit
+        configure_tls(verify=self.verify_tls_var.get(), ca_bundle=None)
         self.set_status("Loading feed...")
         threading.Thread(target=self._load_feed_worker, args=(url, limit, pages, self.mode_var.get()), daemon=True).start()
 
@@ -303,6 +307,7 @@ class App:
 
         out_dir = self.out_var.get().strip() or "./downloads"
         os.makedirs(out_dir, exist_ok=True)
+        configure_tls(verify=self.verify_tls_var.get(), ca_bundle=None)
         if not self.history_keys:
             self.history_keys = load_download_history(out_dir)
         selected = [self.item_by_iid[iid] for iid in selected_iids if iid in self.item_by_iid]
