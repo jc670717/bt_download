@@ -37,7 +37,6 @@ DEFAULT_UA = (
 )
 TLS_VERIFY = True
 TLS_CA_BUNDLE: Optional[str] = None
-PROXY_URL: Optional[str] = None
 DEFAULT_TIMEOUT = 45
 DEFAULT_RETRIES = 3
 
@@ -60,11 +59,6 @@ def configure_tls(verify: bool = True, ca_bundle: Optional[str] = None) -> None:
     global TLS_VERIFY, TLS_CA_BUNDLE
     TLS_VERIFY = verify
     TLS_CA_BUNDLE = ca_bundle
-
-
-def configure_network(proxy_url: Optional[str] = None) -> None:
-    global PROXY_URL
-    PROXY_URL = proxy_url.strip() if proxy_url else None
 
 
 def _ssl_context() -> ssl.SSLContext:
@@ -100,11 +94,6 @@ def _is_cert_verify_error(e: Exception) -> bool:
 
 
 def _open_request(req: urllib.request.Request, timeout: int, context: ssl.SSLContext):
-    if PROXY_URL:
-        proxy_handler = urllib.request.ProxyHandler({"http": PROXY_URL, "https": PROXY_URL})
-        https_handler = urllib.request.HTTPSHandler(context=context)
-        opener = urllib.request.build_opener(proxy_handler, https_handler)
-        return opener.open(req, timeout=timeout)
     return urllib.request.urlopen(req, timeout=timeout, context=context)
 
 
@@ -148,12 +137,18 @@ def item_history_key(item: TorrentItem) -> str:
     return f"name:{item.name.strip().lower()}"
 
 
-def history_file_path(out_dir: str) -> str:
-    return os.path.join(out_dir, "download_history.json")
+def app_base_dir() -> str:
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
 
 
-def load_download_history(out_dir: str) -> set[str]:
-    path = history_file_path(out_dir)
+def history_file_path() -> str:
+    return os.path.join(app_base_dir(), "download_history.json")
+
+
+def load_download_history() -> set[str]:
+    path = history_file_path()
     if not os.path.exists(path):
         return set()
     try:
@@ -167,8 +162,8 @@ def load_download_history(out_dir: str) -> set[str]:
     return set()
 
 
-def save_download_history(out_dir: str, keys: set[str]) -> None:
-    path = history_file_path(out_dir)
+def save_download_history(keys: set[str]) -> None:
+    path = history_file_path()
     payload = {"version": 1, "items": sorted(keys)}
     with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
@@ -527,7 +522,7 @@ def looks_like_feed_url(url: str) -> bool:
 
 
 def mark_downloaded(items: List[TorrentItem], out_dir: str, history_keys: Optional[set[str]] = None) -> None:
-    keys = history_keys if history_keys is not None else load_download_history(out_dir)
+    keys = history_keys if history_keys is not None else load_download_history()
     for it in items:
         out_path = os.path.join(out_dir, sanitize_filename(it.name) + ".torrent")
         in_dir = os.path.exists(out_path)
@@ -606,10 +601,8 @@ def run() -> int:
     parser.add_argument("--pages", type=int, default=1, help="Follow rel=next for up to N pages (default: 1)")
     parser.add_argument("--insecure", action="store_true", help="Disable TLS certificate verification (not recommended)")
     parser.add_argument("--ca-bundle", default="", help="Custom CA bundle path for TLS verification")
-    parser.add_argument("--proxy", default="", help="Proxy URL, e.g. http://127.0.0.1:7890")
     args = parser.parse_args()
     configure_tls(verify=not args.insecure, ca_bundle=(args.ca_bundle.strip() or None))
-    configure_network(proxy_url=(args.proxy.strip() or None))
 
     try:
         if looks_like_feed_url(args.url):
@@ -625,6 +618,17 @@ def run() -> int:
         if normalized_url != args.url:
             print(f"[info] normalized URL -> {normalized_url}")
         print(f"[info] loaded pages: {pages_loaded}")
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            print(
+                "[error] HTTP 404 from target URL.\n"
+                "This usually means the current network path/client is blocked or treated differently by the site, "
+                "not a parser bug in this tool.",
+                file=sys.stderr,
+            )
+        else:
+            print(f"[error] HTTP {e.code}: {e.reason}", file=sys.stderr)
+        return 2
     except (urllib.error.URLError, TimeoutError) as e:
         print(f"[error] Failed to fetch feed: {e}", file=sys.stderr)
         return 2
@@ -643,7 +647,7 @@ def run() -> int:
         return 0
 
     os.makedirs(args.out, exist_ok=True)
-    history_keys = load_download_history(args.out)
+    history_keys = load_download_history()
     mark_downloaded(items, args.out, history_keys)
     shown = items[: max(1, args.limit)]
     print(format_table(shown))
@@ -684,7 +688,7 @@ def run() -> int:
             fail += 1
             print(f"[fail] #{it.idx} {it.name} -> {e}", file=sys.stderr)
 
-    save_download_history(args.out, history_keys)
+    save_download_history(history_keys)
     print(f"[done] success={ok}, failed={fail}")
     return 0 if fail == 0 else 1
 

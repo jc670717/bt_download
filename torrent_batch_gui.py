@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import json
 import os
 import re
 import threading
@@ -10,18 +11,14 @@ from tkinter import filedialog, messagebox, ttk
 
 from torrent_batch_cli import (
     TorrentItem,
-    configure_network,
+    app_base_dir,
     download_file,
-    fetch_xml,
     item_history_key,
-    looks_like_html,
-    looks_like_xml,
     looks_like_feed_url,
-    load_items_from_html,
-    load_items_from_feed,
     load_download_history,
+    load_items_from_feed,
+    load_items_from_html,
     mark_downloaded,
-    normalize_url,
     save_download_history,
     sanitize_filename,
 )
@@ -41,16 +38,47 @@ class App:
         self.current_limit = 1000
         self.history_keys: set[str] = set()
 
-        self.url_var = tk.StringVar(value="https://sukebei.nyaa.si")
-        self.out_var = tk.StringVar(value=os.path.abspath("/Users/leonchang/Library/CloudStorage/Dropbox/torrent"))
-        self.limit_var = tk.StringVar(value="10000")
-        self.pages_var = tk.StringVar(value="10")
+        self.url_var = tk.StringVar(value="")
+        self.out_var = tk.StringVar(value=os.path.abspath("./downloads"))
+        self.limit_var = tk.StringVar(value="1000")
+        self.pages_var = tk.StringVar(value="1")
         self.search_var = tk.StringVar(value="")
-        self.proxy_var = tk.StringVar(value="")
         self.status_var = tk.StringVar(value="Ready")
         self.progress_var = tk.DoubleVar(value=0.0)
 
+        self._load_settings()
         self._build_ui()
+
+    def _settings_path(self) -> str:
+        return os.path.join(app_base_dir(), "app_settings.json")
+
+    def _load_settings(self) -> None:
+        path = self._settings_path()
+        if not os.path.exists(path):
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                self.url_var.set(str(data.get("feed_url", self.url_var.get())))
+                self.out_var.set(str(data.get("output", self.out_var.get())))
+                self.limit_var.set(str(data.get("limit", self.limit_var.get())))
+                self.pages_var.set(str(data.get("pages", self.pages_var.get())))
+        except Exception:
+            pass
+
+    def _save_settings(self) -> None:
+        payload = {
+            "feed_url": self.url_var.get().strip(),
+            "output": self.out_var.get().strip(),
+            "limit": self.limit_var.get().strip(),
+            "pages": self.pages_var.get().strip(),
+        }
+        try:
+            with open(self._settings_path(), "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
 
     def _build_ui(self) -> None:
         top = ttk.Frame(self.root, padding=10)
@@ -59,7 +87,6 @@ class App:
         ttk.Label(top, text="Feed URL").grid(row=0, column=0, sticky="w")
         ttk.Entry(top, textvariable=self.url_var, width=95).grid(row=0, column=1, columnspan=4, sticky="ew", padx=(8, 8))
         ttk.Button(top, text="Load", command=self.load_feed).grid(row=0, column=5, sticky="ew")
-        ttk.Button(top, text="Diagnose", command=self.diagnose_url).grid(row=0, column=6, sticky="ew", padx=(8, 0))
 
         ttk.Label(top, text="Output").grid(row=1, column=0, sticky="w", pady=(8, 0))
         ttk.Entry(top, textvariable=self.out_var, width=95).grid(row=1, column=1, columnspan=3, sticky="ew", padx=(8, 8), pady=(8, 0))
@@ -78,10 +105,7 @@ class App:
         search_entry.bind("<KeyRelease>", lambda _e: self.apply_filter_and_refresh())
         ttk.Button(top, text="Clear", command=self.clear_filter).grid(row=2, column=5, sticky="ew", pady=(8, 0))
 
-        ttk.Label(top, text="Proxy").grid(row=3, column=0, sticky="w", pady=(8, 0))
-        ttk.Entry(top, textvariable=self.proxy_var).grid(row=3, column=1, columnspan=4, sticky="ew", padx=(8, 8), pady=(8, 0))
-
-        for i in range(7):
+        for i in range(6):
             top.grid_columnconfigure(i, weight=1 if i in (1, 2, 3) else 0)
 
         mid = ttk.Frame(self.root, padding=(10, 0, 10, 0))
@@ -141,7 +165,8 @@ class App:
         folder = filedialog.askdirectory(initialdir=self.out_var.get() or os.getcwd())
         if folder:
             self.out_var.set(folder)
-            self.history_keys = load_download_history(folder)
+            self.history_keys = load_download_history()
+            self._save_settings()
             if self.items:
                 mark_downloaded(self.items, folder, self.history_keys)
                 self.apply_filter_and_refresh()
@@ -227,7 +252,6 @@ class App:
             iid = str(it.idx)
             warn = self._to_size_bytes(it.size) > 3 * 1024**3
             if it.downloaded == "Yes":
-                # Downloaded style has higher priority than warning style.
                 tags = ("downloaded",)
             elif warn:
                 tags = ("warn",)
@@ -265,35 +289,9 @@ class App:
             return
 
         self.current_limit = limit
-        configure_network(proxy_url=(self.proxy_var.get().strip() or None))
+        self._save_settings()
         self.set_status("Loading feed...")
         threading.Thread(target=self._load_feed_worker, args=(url, limit, pages), daemon=True).start()
-
-    def diagnose_url(self) -> None:
-        url = self.url_var.get().strip()
-        if not url:
-            messagebox.showerror("Error", "Please enter URL.")
-            return
-        configure_network(proxy_url=(self.proxy_var.get().strip() or None))
-        self.set_status("Diagnosing URL...")
-        threading.Thread(target=self._diagnose_worker, args=(url,), daemon=True).start()
-
-    def _diagnose_worker(self, url: str) -> None:
-        try:
-            normalized = normalize_url(url)
-            text = fetch_xml(normalized, timeout=20, retries=1)
-            kind = "HTML" if looks_like_html(text) else ("XML" if looks_like_xml(text) else "Unknown")
-            hint = "Detected feed-like URL" if looks_like_feed_url(normalized) else "Detected web-page URL"
-            preview = text.lstrip()[:220].replace("\n", " ").replace("\r", " ")
-            msg = f"Reachable.\nURL: {normalized}\nType: {kind}\nHint: {hint}\nPreview: {preview}"
-            self.root.after(0, lambda: messagebox.showinfo("Diagnose", msg))
-            self.root.after(0, lambda: self.set_status("Diagnose done"))
-        except urllib.error.HTTPError as e:
-            self.root.after(0, lambda: messagebox.showerror("Diagnose", f"HTTP {e.code}: {e.reason}"))
-            self.root.after(0, lambda: self.set_status("Diagnose failed"))
-        except Exception as e:  # noqa: BLE001
-            self.root.after(0, lambda: messagebox.showerror("Diagnose", str(e)))
-            self.root.after(0, lambda: self.set_status("Diagnose failed"))
 
     def _load_feed_worker(self, url: str, limit: int, pages: int) -> None:
         try:
@@ -307,17 +305,31 @@ class App:
                     items, pages_loaded, normalized = load_items_from_html(url, pages)
                 except Exception:
                     items, pages_loaded, normalized = load_items_from_feed(url, pages)
+
             if not items:
                 raise ValueError("No torrent items found in this feed.")
+
             out_dir = self.out_var.get().strip() or "./downloads"
-            self.history_keys = load_download_history(out_dir)
+            self.history_keys = load_download_history()
             mark_downloaded(items, out_dir, self.history_keys)
             self.items = items
             self.root.after(0, self.apply_filter_and_refresh)
+
             status = f"Loaded {min(len(items), max(1, limit))} shown / {len(items)} total from {pages_loaded} page(s)"
             if normalized != url:
                 status += f" (normalized: {normalized})"
             self.root.after(0, lambda: self.set_status(status))
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                msg = (
+                    "HTTP 404 from target URL.\n\n"
+                    "Likely network-path/client restriction for this environment. "
+                    "If curl also returns 404, this is not a parser bug."
+                )
+            else:
+                msg = f"HTTP {e.code}: {e.reason}"
+            self.root.after(0, lambda: messagebox.showerror("Load failed", msg))
+            self.root.after(0, lambda: self.set_status("Load failed"))
         except Exception as e:  # noqa: BLE001
             self.root.after(0, lambda: messagebox.showerror("Load failed", str(e)))
             self.root.after(0, lambda: self.set_status("Load failed"))
@@ -339,9 +351,9 @@ class App:
 
         out_dir = self.out_var.get().strip() or "./downloads"
         os.makedirs(out_dir, exist_ok=True)
-        configure_network(proxy_url=(self.proxy_var.get().strip() or None))
         if not self.history_keys:
-            self.history_keys = load_download_history(out_dir)
+            self.history_keys = load_download_history()
+
         selected = [self.item_by_iid[iid] for iid in selected_iids if iid in self.item_by_iid]
         self.set_status(f"Downloading {len(selected)} item(s)...")
         self.set_progress(0)
@@ -356,8 +368,7 @@ class App:
 
         for i, it in enumerate(selected, start=1):
             self.root.after(0, lambda i=i, total=total, it=it: self.set_status(f"Downloading {i}/{total}: {it.name}"))
-            base = sanitize_filename(it.name)
-            out_path = os.path.join(out_dir, f"{base}.torrent")
+            out_path = os.path.join(out_dir, f"{sanitize_filename(it.name)}.torrent")
 
             try:
                 download_file(it.torrent_url, out_path)
@@ -371,11 +382,12 @@ class App:
             self.root.after(0, lambda i=i, total=total: self.set_progress((i / total) * 100.0))
 
         msg = f"Done. success={ok}, failed={fail}"
-        save_download_history(out_dir, self.history_keys)
+        save_download_history(self.history_keys)
         self.root.after(0, self.apply_filter_and_refresh)
         self.root.after(0, lambda: self.set_status(msg))
         self.root.after(0, lambda: self.set_progress(100.0))
         self.root.after(0, lambda: self.set_downloading(False))
+
         if errors:
             details = "\n".join(errors[:8])
             if len(errors) > 8:
