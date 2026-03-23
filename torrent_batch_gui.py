@@ -47,6 +47,7 @@ class App:
         self.limit_var = tk.StringVar(value="1000")
         self.pages_var = tk.StringVar(value="1")
         self.search_var = tk.StringVar(value="")
+        self.show_downloaded_only_var = tk.BooleanVar(value=False)
         self.selected_count_var = tk.StringVar(value="Selected: 0")
         self.status_var = tk.StringVar(value="Ready")
         self.progress_var = tk.DoubleVar(value=0.0)
@@ -136,6 +137,12 @@ class App:
         ttk.Button(top, text="Load", command=self.load_feed).grid(row=0, column=5, sticky="ew")
         ttk.Button(top, text="Force Refresh", command=self.force_refresh_feed).grid(row=0, column=6, sticky="ew", padx=(8, 0))
         ttk.Button(top, text="Clear Cache", command=self.clear_feed_cache).grid(row=0, column=7, sticky="ew", padx=(8, 0))
+        ttk.Checkbutton(
+            top,
+            text="Show Downloaded Only",
+            variable=self.show_downloaded_only_var,
+            command=self.apply_filter_and_refresh,
+        ).grid(row=1, column=6, columnspan=2, sticky="w", padx=(8, 0), pady=(8, 0))
 
         ttk.Label(top, text="Output").grid(row=1, column=0, sticky="w", pady=(8, 0))
         ttk.Entry(top, textvariable=self.out_var, width=95).grid(row=1, column=1, columnspan=3, sticky="ew", padx=(8, 8), pady=(8, 0))
@@ -317,11 +324,14 @@ class App:
     def apply_filter_and_refresh(self) -> None:
         q = self.search_var.get().strip().lower()
         base = self.items
+        if self.show_downloaded_only_var.get():
+            base = [it for it in base if it.downloaded == "Yes"]
         if q:
             base = [
                 it
                 for it in self.items
-                if q in it.name.lower() or q in it.date.lower() or q in it.downloaded.lower()
+                if (not self.show_downloaded_only_var.get() or it.downloaded == "Yes")
+                and (q in it.name.lower() or q in it.date.lower() or q in it.downloaded.lower())
             ]
         self.filtered_items = self._sorted_items(base)
         self.populate_table(self.filtered_items, self.current_limit, preserve_status=True)
