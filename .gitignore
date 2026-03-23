@@ -3,3 +3,4 @@ __pycache__/
 *.pyc
 app_settings.json
 download_history.json
+source_cache.json

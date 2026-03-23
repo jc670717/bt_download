@@ -147,6 +147,140 @@ def history_file_path() -> str:
     return os.path.join(app_base_dir(), "download_history.json")
 
 
+def item_cache_key(item: TorrentItem) -> str:
+    return item_history_key(item)
+
+
+def source_cache_file_path() -> str:
+    return os.path.join(app_base_dir(), "source_cache.json")
+
+
+def _item_to_dict(item: TorrentItem) -> dict[str, object]:
+    return {
+        "name": item.name,
+        "date": item.date,
+        "size": item.size,
+        "seeders": item.seeders,
+        "leechers": item.leechers,
+        "downloads": item.downloads,
+        "torrent_url": item.torrent_url,
+        "timestamp": item.timestamp,
+    }
+
+
+def _item_from_dict(idx: int, data: object) -> Optional[TorrentItem]:
+    if not isinstance(data, dict):
+        return None
+    torrent_url = str(data.get("torrent_url", "")).strip()
+    name = str(data.get("name", "")).strip()
+    if not torrent_url or not name:
+        return None
+    return TorrentItem(
+        idx=idx,
+        name=name,
+        date=str(data.get("date", "-")),
+        size=str(data.get("size", "-")),
+        seeders=str(data.get("seeders", "-")),
+        leechers=str(data.get("leechers", "-")),
+        downloads=str(data.get("downloads", "-")),
+        torrent_url=torrent_url,
+        timestamp=int(data.get("timestamp", 0) or 0),
+    )
+
+
+def load_source_cache() -> dict[str, dict[str, object]]:
+    path = source_cache_file_path()
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        sources = payload.get("sources", {})
+        if isinstance(sources, dict):
+            return {str(k): v for k, v in sources.items() if isinstance(v, dict)}
+    except Exception:  # noqa: BLE001
+        return {}
+    return {}
+
+
+def save_source_cache(sources: dict[str, dict[str, object]]) -> None:
+    path = source_cache_file_path()
+    payload = {"version": 1, "sources": sources}
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+
+def _source_cache_key(source_kind: str, normalized_url: str) -> str:
+    return f"{source_kind}:{normalized_url.strip()}"
+
+
+def clear_source_cache(normalized_url: Optional[str] = None, source_kind: Optional[str] = None) -> int:
+    sources = load_source_cache()
+    if normalized_url is None and source_kind is None:
+        removed = len(sources)
+        save_source_cache({})
+        return removed
+
+    kept: dict[str, dict[str, object]] = {}
+    removed = 0
+    for key, value in sources.items():
+        entry_url = str(value.get("url", "")).strip()
+        entry_kind = str(value.get("kind", "")).strip()
+        url_matches = normalized_url is None or entry_url == normalized_url
+        kind_matches = source_kind is None or entry_kind == source_kind
+        if url_matches and kind_matches:
+            removed += 1
+            continue
+        kept[key] = value
+    save_source_cache(kept)
+    return removed
+
+
+def load_cached_source_items(source_kind: str, normalized_url: str) -> List[TorrentItem]:
+    sources = load_source_cache()
+    entry = sources.get(_source_cache_key(source_kind, normalized_url), {})
+    raw_items = entry.get("items", [])
+    if not isinstance(raw_items, list):
+        return []
+
+    items: List[TorrentItem] = []
+    for idx, raw in enumerate(raw_items, start=1):
+        item = _item_from_dict(idx, raw)
+        if item is not None:
+            items.append(item)
+    return items
+
+
+def save_cached_source_items(source_kind: str, normalized_url: str, items: List[TorrentItem]) -> None:
+    sources = load_source_cache()
+    cache_key = _source_cache_key(source_kind, normalized_url)
+    sources[cache_key] = {
+        "url": normalized_url,
+        "kind": source_kind,
+        "saved_at": int(time.time()),
+        "items": [_item_to_dict(item) for item in items],
+    }
+    save_source_cache(sources)
+
+
+def _dedupe_items(items: Iterable[TorrentItem]) -> List[TorrentItem]:
+    unique: List[TorrentItem] = []
+    seen: set[str] = set()
+    for item in items:
+        key = item_cache_key(item)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(item)
+    for idx, item in enumerate(unique, start=1):
+        item.idx = idx
+    return unique
+
+
+def _merge_cached_items(new_items: List[TorrentItem], cached_items: List[TorrentItem]) -> List[TorrentItem]:
+    return _dedupe_items([*new_items, *cached_items])
+
+
 def load_download_history() -> set[str]:
     path = history_file_path()
     if not os.path.exists(path):
@@ -436,15 +570,18 @@ def extract_next_html_url(listing_html: str, base_url: str) -> Optional[str]:
     return None
 
 
-def load_items_from_feed(url: str, max_pages: int = 1) -> tuple[List[TorrentItem], int, str]:
+def load_items_from_feed(url: str, max_pages: int = 1, refresh_all: bool = False) -> tuple[List[TorrentItem], int, str]:
     if max_pages < 1:
         max_pages = 1
 
     normalized_url = normalize_url(normalize_feed_url(url))
+    cached_items = [] if refresh_all else load_cached_source_items("feed", normalized_url)
+    known_keys = {item_cache_key(item) for item in cached_items}
     items: List[TorrentItem] = []
     visited: set[str] = set()
     page_count = 0
     current_url = normalized_url
+    stop_after_page = False
 
     while current_url and page_count < max_pages and current_url not in visited:
         visited.add(current_url)
@@ -461,29 +598,48 @@ def load_items_from_feed(url: str, max_pages: int = 1) -> tuple[List[TorrentItem
             raise ValueError("URL returned HTML, not RSS/Atom XML.")
 
         page_items = parse_feed(xml_text, current_url)
-        items.extend(page_items)
+        if known_keys:
+            page_known = False
+            page_new: List[TorrentItem] = []
+            for item in page_items:
+                if item_cache_key(item) in known_keys:
+                    page_known = True
+                    continue
+                page_new.append(item)
+            items.extend(page_new)
+            if page_known:
+                stop_after_page = True
+        else:
+            items.extend(page_items)
         page_count += 1
+
+        if stop_after_page:
+            break
 
         next_url = extract_next_feed_url(xml_text, current_url)
         if not next_url:
             break
         current_url = next_url
 
-    for i, item in enumerate(items, start=1):
-        item.idx = i
+    merged_items = _merge_cached_items(items, cached_items) if cached_items else _dedupe_items(items)
+    if merged_items:
+        save_cached_source_items("feed", normalized_url, merged_items)
 
-    return items, page_count, normalized_url
+    return merged_items, page_count, normalized_url
 
 
-def load_items_from_html(url: str, max_pages: int = 1) -> tuple[List[TorrentItem], int, str]:
+def load_items_from_html(url: str, max_pages: int = 1, refresh_all: bool = False) -> tuple[List[TorrentItem], int, str]:
     if max_pages < 1:
         max_pages = 1
 
     normalized_url = normalize_url(url)
+    cached_items = [] if refresh_all else load_cached_source_items("html", normalized_url)
+    known_keys = {item_cache_key(item) for item in cached_items}
     items: List[TorrentItem] = []
     visited: set[str] = set()
     page_count = 0
     current_url = normalized_url
+    stop_after_page = False
 
     while current_url and page_count < max_pages and current_url not in visited:
         visited.add(current_url)
@@ -498,18 +654,34 @@ def load_items_from_html(url: str, max_pages: int = 1) -> tuple[List[TorrentItem
             raise ValueError("URL did not return HTML listing content.")
 
         page_items = parse_listing_html(text, current_url)
-        items.extend(page_items)
+        if known_keys:
+            page_known = False
+            page_new: List[TorrentItem] = []
+            for item in page_items:
+                if item_cache_key(item) in known_keys:
+                    page_known = True
+                    continue
+                page_new.append(item)
+            items.extend(page_new)
+            if page_known:
+                stop_after_page = True
+        else:
+            items.extend(page_items)
         page_count += 1
+
+        if stop_after_page:
+            break
 
         next_url = extract_next_html_url(text, current_url)
         if not next_url:
             break
         current_url = next_url
 
-    for i, item in enumerate(items, start=1):
-        item.idx = i
+    merged_items = _merge_cached_items(items, cached_items) if cached_items else _dedupe_items(items)
+    if merged_items:
+        save_cached_source_items("html", normalized_url, merged_items)
 
-    return items, page_count, normalized_url
+    return merged_items, page_count, normalized_url
 
 
 def looks_like_feed_url(url: str) -> bool:
@@ -601,20 +773,29 @@ def run() -> int:
     parser.add_argument("--pages", type=int, default=1, help="Follow rel=next for up to N pages (default: 1)")
     parser.add_argument("--insecure", action="store_true", help="Disable TLS certificate verification (not recommended)")
     parser.add_argument("--ca-bundle", default="", help="Custom CA bundle path for TLS verification")
+    parser.add_argument("--refresh-all", action="store_true", help="Ignore local list cache and fetch all requested pages")
+    parser.add_argument("--clear-cache", action="store_true", help="Clear local list cache for this URL before loading")
     args = parser.parse_args()
     configure_tls(verify=not args.insecure, ca_bundle=(args.ca_bundle.strip() or None))
+
+    normalized_feed_url = normalize_url(normalize_feed_url(args.url))
+    normalized_html_url = normalize_url(args.url)
+    if args.clear_cache:
+        removed = clear_source_cache(normalized_feed_url, "feed")
+        removed += clear_source_cache(normalized_html_url, "html")
+        print(f"[info] cleared cache entries: {removed}")
 
     try:
         if looks_like_feed_url(args.url):
             try:
-                items, pages_loaded, normalized_url = load_items_from_feed(args.url, args.pages)
+                items, pages_loaded, normalized_url = load_items_from_feed(args.url, args.pages, refresh_all=args.refresh_all)
             except Exception:
-                items, pages_loaded, normalized_url = load_items_from_html(args.url, args.pages)
+                items, pages_loaded, normalized_url = load_items_from_html(args.url, args.pages, refresh_all=args.refresh_all)
         else:
             try:
-                items, pages_loaded, normalized_url = load_items_from_html(args.url, args.pages)
+                items, pages_loaded, normalized_url = load_items_from_html(args.url, args.pages, refresh_all=args.refresh_all)
             except Exception:
-                items, pages_loaded, normalized_url = load_items_from_feed(args.url, args.pages)
+                items, pages_loaded, normalized_url = load_items_from_feed(args.url, args.pages, refresh_all=args.refresh_all)
         if normalized_url != args.url:
             print(f"[info] normalized URL -> {normalized_url}")
         print(f"[info] loaded pages: {pages_loaded}")
