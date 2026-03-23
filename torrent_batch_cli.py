@@ -143,8 +143,8 @@ def app_base_dir() -> str:
     return os.path.dirname(os.path.abspath(__file__))
 
 
-def history_file_path() -> str:
-    return os.path.join(app_base_dir(), "download_history.json")
+def history_file_path(out_dir: str) -> str:
+    return os.path.join(os.path.abspath(out_dir), "download_history.json")
 
 
 def item_cache_key(item: TorrentItem) -> str:
@@ -281,8 +281,8 @@ def _merge_cached_items(new_items: List[TorrentItem], cached_items: List[Torrent
     return _dedupe_items([*new_items, *cached_items])
 
 
-def load_download_history() -> set[str]:
-    path = history_file_path()
+def load_download_history(out_dir: str) -> set[str]:
+    path = history_file_path(out_dir)
     if not os.path.exists(path):
         return set()
     try:
@@ -296,8 +296,8 @@ def load_download_history() -> set[str]:
     return set()
 
 
-def save_download_history(keys: set[str]) -> None:
-    path = history_file_path()
+def save_download_history(out_dir: str, keys: set[str]) -> None:
+    path = history_file_path(out_dir)
     payload = {"version": 1, "items": sorted(keys)}
     with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
@@ -694,7 +694,7 @@ def looks_like_feed_url(url: str) -> bool:
 
 
 def mark_downloaded(items: List[TorrentItem], out_dir: str, history_keys: Optional[set[str]] = None) -> None:
-    keys = history_keys if history_keys is not None else load_download_history()
+    keys = history_keys if history_keys is not None else load_download_history(out_dir)
     for it in items:
         out_path = os.path.join(out_dir, sanitize_filename(it.name) + ".torrent")
         in_dir = os.path.exists(out_path)
@@ -828,7 +828,7 @@ def run() -> int:
         return 0
 
     os.makedirs(args.out, exist_ok=True)
-    history_keys = load_download_history()
+    history_keys = load_download_history(args.out)
     mark_downloaded(items, args.out, history_keys)
     shown = items[: max(1, args.limit)]
     print(format_table(shown))
@@ -869,7 +869,7 @@ def run() -> int:
             fail += 1
             print(f"[fail] #{it.idx} {it.name} -> {e}", file=sys.stderr)
 
-    save_download_history(history_keys)
+    save_download_history(args.out, history_keys)
     print(f"[done] success={ok}, failed={fail}")
     return 0 if fail == 0 else 1
 

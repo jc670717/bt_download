@@ -223,7 +223,7 @@ class App:
         folder = filedialog.askdirectory(initialdir=self._current_output_dir())
         if folder:
             self.out_var.set(self._resolve_output_dir(folder))
-            self.history_keys = load_download_history()
+            self.history_keys = load_download_history(self._current_output_dir())
             self._save_settings()
             if self.items:
                 mark_downloaded(self.items, self._current_output_dir(), self.history_keys)
@@ -421,7 +421,7 @@ class App:
                 raise ValueError("No torrent items found in this feed.")
 
             out_dir = self._current_output_dir()
-            self.history_keys = load_download_history()
+            self.history_keys = load_download_history(out_dir)
             mark_downloaded(items, out_dir, self.history_keys)
             self.items = items
             self.root.after(0, self.apply_filter_and_refresh)
@@ -470,7 +470,7 @@ class App:
             self.set_status("Invalid output folder")
             return
         if not self.history_keys:
-            self.history_keys = load_download_history()
+            self.history_keys = load_download_history(out_dir)
 
         selected = [self.item_by_iid[iid] for iid in selected_iids if iid in self.item_by_iid]
         self.set_status(f"Downloading {len(selected)} item(s)...")
@@ -500,7 +500,7 @@ class App:
             self.root.after(0, lambda i=i, total=total: self.set_progress((i / total) * 100.0))
 
         msg = f"Done. success={ok}, failed={fail}"
-        save_download_history(self.history_keys)
+        save_download_history(out_dir, self.history_keys)
         self.root.after(0, self.apply_filter_and_refresh)
         self.root.after(0, lambda: self.set_status(msg))
         self.root.after(0, lambda: self.set_progress(100.0))
