@@ -15,8 +15,8 @@ Output file:
 Run in PowerShell from project root:
 
 ```powershell
-python -m pip install --upgrade pip
-pip install pyinstaller
+py -3 -m pip install --upgrade pip
+py -3 -m pip install pyinstaller
 ./build_windows.ps1
 ```
 

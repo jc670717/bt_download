@@ -15,11 +15,14 @@ import argparse
 import gzip
 import html
 import json
+import errno
 import os
 import re
 import ssl
 import socket
 import sys
+import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -39,6 +42,8 @@ TLS_VERIFY = True
 TLS_CA_BUNDLE: Optional[str] = None
 DEFAULT_TIMEOUT = 45
 DEFAULT_RETRIES = 3
+AUTO_FALLBACK_EXCEPTIONS = (ValueError, ET.ParseError)
+SOURCE_CACHE_LOCK = threading.RLock()
 
 
 @dataclass
@@ -143,6 +148,17 @@ def app_base_dir() -> str:
     return os.path.dirname(os.path.abspath(__file__))
 
 
+def user_data_dir() -> str:
+    base = (
+        os.environ.get("LOCALAPPDATA")
+        or os.environ.get("APPDATA")
+        or os.path.join(os.path.expanduser("~"), ".torrent_batch_downloader")
+    )
+    path = os.path.join(base, "TorrentBatchDownloader")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
 def history_file_path(out_dir: str) -> str:
     return os.path.join(os.path.abspath(out_dir), "download_history.json")
 
@@ -152,7 +168,30 @@ def item_cache_key(item: TorrentItem) -> str:
 
 
 def source_cache_file_path() -> str:
-    return os.path.join(app_base_dir(), "source_cache.json")
+    return os.path.join(user_data_dir(), "source_cache.json")
+
+
+def _write_json_atomic(path: str, payload: object) -> None:
+    parent = os.path.dirname(path)
+    os.makedirs(parent, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix=".tmp-", suffix=".json", dir=parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError as e:
+                # Some Windows/network-backed folders reject fsync on temp files.
+                if e.errno != errno.EBADF:
+                    raise
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def _item_to_dict(item: TorrentItem) -> dict[str, object]:
@@ -189,6 +228,11 @@ def _item_from_dict(idx: int, data: object) -> Optional[TorrentItem]:
 
 
 def load_source_cache() -> dict[str, dict[str, object]]:
+    with SOURCE_CACHE_LOCK:
+        return _load_source_cache_unlocked()
+
+
+def _load_source_cache_unlocked() -> dict[str, dict[str, object]]:
     path = source_cache_file_path()
     if not os.path.exists(path):
         return {}
@@ -204,10 +248,14 @@ def load_source_cache() -> dict[str, dict[str, object]]:
 
 
 def save_source_cache(sources: dict[str, dict[str, object]]) -> None:
+    with SOURCE_CACHE_LOCK:
+        _save_source_cache_unlocked(sources)
+
+
+def _save_source_cache_unlocked(sources: dict[str, dict[str, object]]) -> None:
     path = source_cache_file_path()
     payload = {"version": 1, "sources": sources}
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
+    _write_json_atomic(path, payload)
 
 
 def _source_cache_key(source_kind: str, normalized_url: str) -> str:
@@ -215,52 +263,55 @@ def _source_cache_key(source_kind: str, normalized_url: str) -> str:
 
 
 def clear_source_cache(normalized_url: Optional[str] = None, source_kind: Optional[str] = None) -> int:
-    sources = load_source_cache()
-    if normalized_url is None and source_kind is None:
-        removed = len(sources)
-        save_source_cache({})
-        return removed
+    with SOURCE_CACHE_LOCK:
+        sources = _load_source_cache_unlocked()
+        if normalized_url is None and source_kind is None:
+            removed = len(sources)
+            _save_source_cache_unlocked({})
+            return removed
 
-    kept: dict[str, dict[str, object]] = {}
-    removed = 0
-    for key, value in sources.items():
-        entry_url = str(value.get("url", "")).strip()
-        entry_kind = str(value.get("kind", "")).strip()
-        url_matches = normalized_url is None or entry_url == normalized_url
-        kind_matches = source_kind is None or entry_kind == source_kind
-        if url_matches and kind_matches:
-            removed += 1
-            continue
-        kept[key] = value
-    save_source_cache(kept)
-    return removed
+        kept: dict[str, dict[str, object]] = {}
+        removed = 0
+        for key, value in sources.items():
+            entry_url = str(value.get("url", "")).strip()
+            entry_kind = str(value.get("kind", "")).strip()
+            url_matches = normalized_url is None or entry_url == normalized_url
+            kind_matches = source_kind is None or entry_kind == source_kind
+            if url_matches and kind_matches:
+                removed += 1
+                continue
+            kept[key] = value
+        _save_source_cache_unlocked(kept)
+        return removed
 
 
 def load_cached_source_items(source_kind: str, normalized_url: str) -> List[TorrentItem]:
-    sources = load_source_cache()
-    entry = sources.get(_source_cache_key(source_kind, normalized_url), {})
-    raw_items = entry.get("items", [])
-    if not isinstance(raw_items, list):
-        return []
+    with SOURCE_CACHE_LOCK:
+        sources = _load_source_cache_unlocked()
+        entry = sources.get(_source_cache_key(source_kind, normalized_url), {})
+        raw_items = entry.get("items", [])
+        if not isinstance(raw_items, list):
+            return []
 
-    items: List[TorrentItem] = []
-    for idx, raw in enumerate(raw_items, start=1):
-        item = _item_from_dict(idx, raw)
-        if item is not None:
-            items.append(item)
-    return items
+        items: List[TorrentItem] = []
+        for idx, raw in enumerate(raw_items, start=1):
+            item = _item_from_dict(idx, raw)
+            if item is not None:
+                items.append(item)
+        return items
 
 
 def save_cached_source_items(source_kind: str, normalized_url: str, items: List[TorrentItem]) -> None:
-    sources = load_source_cache()
-    cache_key = _source_cache_key(source_kind, normalized_url)
-    sources[cache_key] = {
-        "url": normalized_url,
-        "kind": source_kind,
-        "saved_at": int(time.time()),
-        "items": [_item_to_dict(item) for item in items],
-    }
-    save_source_cache(sources)
+    with SOURCE_CACHE_LOCK:
+        sources = _load_source_cache_unlocked()
+        cache_key = _source_cache_key(source_kind, normalized_url)
+        sources[cache_key] = {
+            "url": normalized_url,
+            "kind": source_kind,
+            "saved_at": int(time.time()),
+            "items": [_item_to_dict(item) for item in items],
+        }
+        _save_source_cache_unlocked(sources)
 
 
 def _dedupe_items(items: Iterable[TorrentItem]) -> List[TorrentItem]:
@@ -299,8 +350,7 @@ def load_download_history(out_dir: str) -> set[str]:
 def save_download_history(out_dir: str, keys: set[str]) -> None:
     path = history_file_path(out_dir)
     payload = {"version": 1, "items": sorted(keys)}
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
+    _write_json_atomic(path, payload)
 
 
 def fetch_xml(url: str, timeout: int = DEFAULT_TIMEOUT, retries: int = DEFAULT_RETRIES) -> str:
@@ -322,7 +372,10 @@ def fetch_xml(url: str, timeout: int = DEFAULT_TIMEOUT, retries: int = DEFAULT_R
         if "gzip" in content_encoding:
             raw = gzip.decompress(raw)
         elif "deflate" in content_encoding:
-            raw = zlib.decompress(raw)
+            try:
+                raw = zlib.decompress(raw)
+            except zlib.error:
+                raw = zlib.decompress(raw, -zlib.MAX_WBITS)
 
         if "charset=" in content_type:
             charset = content_type.split("charset=", 1)[1].split(";")[0].strip()
@@ -693,6 +746,16 @@ def looks_like_feed_url(url: str) -> bool:
     return (q.get("page", [""])[0] or "") == "rss"
 
 
+def load_items_auto(url: str, max_pages: int = 1, refresh_all: bool = False) -> tuple[List[TorrentItem], int, str]:
+    primary_loader = load_items_from_feed if looks_like_feed_url(url) else load_items_from_html
+    fallback_loader = load_items_from_html if primary_loader is load_items_from_feed else load_items_from_feed
+
+    try:
+        return primary_loader(url, max_pages, refresh_all=refresh_all)
+    except AUTO_FALLBACK_EXCEPTIONS:
+        return fallback_loader(url, max_pages, refresh_all=refresh_all)
+
+
 def mark_downloaded(items: List[TorrentItem], out_dir: str, history_keys: Optional[set[str]] = None) -> None:
     keys = history_keys if history_keys is not None else load_download_history(out_dir)
     for it in items:
@@ -786,16 +849,7 @@ def run() -> int:
         print(f"[info] cleared cache entries: {removed}")
 
     try:
-        if looks_like_feed_url(args.url):
-            try:
-                items, pages_loaded, normalized_url = load_items_from_feed(args.url, args.pages, refresh_all=args.refresh_all)
-            except Exception:
-                items, pages_loaded, normalized_url = load_items_from_html(args.url, args.pages, refresh_all=args.refresh_all)
-        else:
-            try:
-                items, pages_loaded, normalized_url = load_items_from_html(args.url, args.pages, refresh_all=args.refresh_all)
-            except Exception:
-                items, pages_loaded, normalized_url = load_items_from_feed(args.url, args.pages, refresh_all=args.refresh_all)
+        items, pages_loaded, normalized_url = load_items_auto(args.url, args.pages, refresh_all=args.refresh_all)
         if normalized_url != args.url:
             print(f"[info] normalized URL -> {normalized_url}")
         print(f"[info] loaded pages: {pages_loaded}")

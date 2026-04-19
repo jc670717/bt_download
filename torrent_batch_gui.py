@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
 import threading
 import tkinter as tk
 import urllib.error
@@ -15,16 +16,20 @@ from torrent_batch_cli import (
     clear_source_cache,
     download_file,
     item_history_key,
-    looks_like_feed_url,
     load_download_history,
-    load_items_from_feed,
-    load_items_from_html,
+    load_items_auto,
     mark_downloaded,
     normalize_feed_url,
     normalize_url,
     save_download_history,
     sanitize_filename,
+    user_data_dir,
 )
+
+DEFAULT_FEED_URL = "https://sukebei.nyaa.si/"
+DEFAULT_LIMIT = "5000"
+DEFAULT_PAGES = "50"
+MAX_RECENT_KEYWORDS = 28
 
 
 class App:
@@ -40,12 +45,13 @@ class App:
         self.sort_desc = False
         self.current_limit = 1000
         self.history_keys: set[str] = set()
-        self.keyword_counts: dict[str, int] = {}
+        self.recent_keywords: list[str] = []
+        self.is_loading = False
 
-        self.url_var = tk.StringVar(value="")
+        self.url_var = tk.StringVar(value=DEFAULT_FEED_URL)
         self.out_var = tk.StringVar(value=self._default_output_dir())
-        self.limit_var = tk.StringVar(value="1000")
-        self.pages_var = tk.StringVar(value="1")
+        self.limit_var = tk.StringVar(value=DEFAULT_LIMIT)
+        self.pages_var = tk.StringVar(value=DEFAULT_PAGES)
         self.search_var = tk.StringVar(value="")
         self.show_downloaded_only_var = tk.BooleanVar(value=False)
         self.selected_count_var = tk.StringVar(value="Selected: 0")
@@ -54,9 +60,13 @@ class App:
 
         self._load_settings()
         self._build_ui()
+        self.root.after(100, self.load_feed)
 
     def _default_output_dir(self) -> str:
-        return os.path.abspath("./downloads")
+        downloads_dir = os.path.join(os.path.expanduser("~"), "Downloads")
+        if os.path.isdir(downloads_dir):
+            return os.path.join(downloads_dir, "TorrentBatchDownloader")
+        return os.path.join(os.path.expanduser("~"), "TorrentBatchDownloader", "downloads")
 
     def _resolve_output_dir(self, raw_path: str) -> str:
         path = (raw_path or "").strip()
@@ -78,29 +88,61 @@ class App:
         return resolved
 
     def _settings_path(self) -> str:
+        return os.path.join(user_data_dir(), "app_settings.json")
+
+    def _legacy_settings_path(self) -> str:
         return os.path.join(app_base_dir(), "app_settings.json")
 
-    def _load_settings(self) -> None:
-        path = self._settings_path()
+    def _load_settings_file(self, path: str) -> dict[str, object] | None:
         if not os.path.exists(path):
-            return
+            return None
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            if isinstance(data, dict):
-                self.url_var.set(str(data.get("feed_url", self.url_var.get())))
-                self.out_var.set(self._resolve_output_dir(str(data.get("output", self.out_var.get()))))
-                self.limit_var.set(str(data.get("limit", self.limit_var.get())))
-                self.pages_var.set(str(data.get("pages", self.pages_var.get())))
-                raw_keywords = data.get("favorite_keywords", {})
-                if isinstance(raw_keywords, dict):
-                    self.keyword_counts = {
-                        str(k).strip(): int(v)
-                        for k, v in raw_keywords.items()
-                        if str(k).strip() and isinstance(v, (int, float)) and int(v) > 0
-                    }
+            return data if isinstance(data, dict) else None
         except Exception:
-            pass
+            return None
+
+    def _extract_recent_keywords(self, data: dict[str, object]) -> list[str]:
+        raw_recent = data.get("recent_keywords", [])
+        if isinstance(raw_recent, list):
+            return [
+                str(x).strip()
+                for x in raw_recent
+                if str(x).strip()
+            ][:MAX_RECENT_KEYWORDS]
+        if isinstance(data.get("favorite_keywords", {}), dict):
+            ranked = sorted(
+                data["favorite_keywords"].items(),
+                key=lambda kv: (-int(kv[1]), str(kv[0]).lower()),
+            )
+            return [str(k).strip() for k, _v in ranked if str(k).strip()][:MAX_RECENT_KEYWORDS]
+        return []
+
+    def _load_settings(self) -> None:
+        settings_path = self._settings_path()
+        legacy_path = self._legacy_settings_path()
+
+        data = self._load_settings_file(settings_path)
+        legacy_data = self._load_settings_file(legacy_path)
+
+        if data is None and legacy_data is None:
+            return
+
+        primary = data or legacy_data or {}
+        self.url_var.set(str(primary.get("feed_url", self.url_var.get())))
+        self.out_var.set(self._resolve_output_dir(str(primary.get("output", self.out_var.get()))))
+        self.limit_var.set(str(primary.get("limit", self.limit_var.get())))
+        self.pages_var.set(str(primary.get("pages", self.pages_var.get())))
+
+        self.recent_keywords = self._extract_recent_keywords(primary)
+        if not self.recent_keywords and legacy_data is not None:
+            self.recent_keywords = self._extract_recent_keywords(legacy_data)
+
+        if data is None or (
+            legacy_data is not None and self._extract_recent_keywords(data or {}) != self.recent_keywords
+        ):
+            self._save_settings()
 
     def _save_settings(self) -> None:
         payload = {
@@ -108,23 +150,25 @@ class App:
             "output": self.out_var.get().strip(),
             "limit": self.limit_var.get().strip(),
             "pages": self.pages_var.get().strip(),
-            "favorite_keywords": self.keyword_counts,
+            "recent_keywords": self.recent_keywords,
         }
         try:
+            os.makedirs(os.path.dirname(self._settings_path()), exist_ok=True)
             with open(self._settings_path(), "w", encoding="utf-8") as f:
                 json.dump(payload, f, ensure_ascii=False, indent=2)
         except Exception:
             pass
 
-    def _top_keywords(self, limit: int = 8) -> list[str]:
-        ranked = sorted(self.keyword_counts.items(), key=lambda kv: (-kv[1], kv[0].lower()))
-        return [keyword for keyword, _count in ranked[:limit]]
+    def _top_keywords(self, limit: int = MAX_RECENT_KEYWORDS) -> list[str]:
+        return self.recent_keywords[:limit]
 
     def _remember_keyword(self, keyword: str) -> None:
         cleaned = " ".join((keyword or "").strip().lower().split())
         if not cleaned:
             return
-        self.keyword_counts[cleaned] = self.keyword_counts.get(cleaned, 0) + 1
+        self.recent_keywords = [x for x in self.recent_keywords if x != cleaned]
+        self.recent_keywords.insert(0, cleaned)
+        self.recent_keywords = self.recent_keywords[:MAX_RECENT_KEYWORDS]
         self._save_settings()
         self._refresh_keyword_buttons()
 
@@ -134,9 +178,12 @@ class App:
 
         ttk.Label(top, text="Feed URL").grid(row=0, column=0, sticky="w")
         ttk.Entry(top, textvariable=self.url_var, width=95).grid(row=0, column=1, columnspan=4, sticky="ew", padx=(8, 8))
-        ttk.Button(top, text="Load", command=self.load_feed).grid(row=0, column=5, sticky="ew")
-        ttk.Button(top, text="Force Refresh", command=self.force_refresh_feed).grid(row=0, column=6, sticky="ew", padx=(8, 0))
-        ttk.Button(top, text="Clear Cache", command=self.clear_feed_cache).grid(row=0, column=7, sticky="ew", padx=(8, 0))
+        self.load_btn = ttk.Button(top, text="Load", command=self.load_feed)
+        self.load_btn.grid(row=0, column=5, sticky="ew")
+        self.force_refresh_btn = ttk.Button(top, text="Force Refresh", command=self.force_refresh_feed)
+        self.force_refresh_btn.grid(row=0, column=6, sticky="ew", padx=(8, 0))
+        self.clear_cache_btn = ttk.Button(top, text="Clear Cache", command=self.clear_feed_cache)
+        self.clear_cache_btn.grid(row=0, column=7, sticky="ew", padx=(8, 0))
         ttk.Checkbutton(
             top,
             text="Show Downloaded Only",
@@ -161,6 +208,8 @@ class App:
         search_entry.bind("<KeyRelease>", lambda _e: self.apply_filter_and_refresh())
         search_entry.bind("<Return>", self.apply_filter_keyword)
         ttk.Button(top, text="Clear", command=self.clear_filter).grid(row=2, column=5, sticky="ew", pady=(8, 0))
+        ttk.Button(top, text="Copy Names", command=self.copy_selected_names).grid(row=2, column=6, sticky="ew", padx=(8, 0), pady=(8, 0))
+        ttk.Button(top, text="Open Output", command=self.open_output_folder).grid(row=2, column=7, sticky="ew", padx=(8, 0), pady=(8, 0))
 
         ttk.Label(top, text="Keywords").grid(row=3, column=0, sticky="nw", pady=(8, 0))
         self.keyword_frame = ttk.Frame(top)
@@ -226,6 +275,13 @@ class App:
         state = tk.DISABLED if is_downloading else tk.NORMAL
         self.download_btn.configure(state=state)
 
+    def set_loading(self, is_loading: bool) -> None:
+        self.is_loading = is_loading
+        state = tk.DISABLED if is_loading else tk.NORMAL
+        self.load_btn.configure(state=state)
+        self.force_refresh_btn.configure(state=state)
+        self.clear_cache_btn.configure(state=state)
+
     def pick_output(self) -> None:
         folder = filedialog.askdirectory(initialdir=self._current_output_dir())
         if folder:
@@ -248,15 +304,18 @@ class App:
 
         keywords = self._top_keywords()
         if not keywords:
-            ttk.Label(self.keyword_frame, text="No saved keywords yet. Press Enter in Filter to save one.").pack(side=tk.LEFT)
+            ttk.Label(self.keyword_frame, text="No recent keywords yet. Press Enter in Filter to save one.").grid(row=0, column=0, sticky="w")
             return
 
-        for keyword in keywords:
+        max_cols = 14
+        for idx, keyword in enumerate(keywords):
+            row = idx // max_cols
+            col = idx % max_cols
             ttk.Button(
                 self.keyword_frame,
                 text=keyword,
                 command=lambda kw=keyword: self.use_saved_keyword(kw),
-            ).pack(side=tk.LEFT, padx=(0, 6))
+            ).grid(row=row, column=col, sticky="w", padx=(0, 4), pady=(0, 4))
 
     def update_selected_count(self) -> None:
         self.selected_count_var.set(f"Selected: {len(self.tree.selection())}")
@@ -300,21 +359,29 @@ class App:
 
     def _sorted_items(self, items: list[TorrentItem]) -> list[TorrentItem]:
         if self.sort_col == "name":
-            key_fn = lambda it: it.name.lower()
+            def key_fn(it: TorrentItem) -> str:
+                return it.name.lower()
         elif self.sort_col == "date":
-            key_fn = lambda it: (it.timestamp, it.date.lower())
+            def key_fn(it: TorrentItem) -> tuple[int, str]:
+                return it.timestamp, it.date.lower()
         elif self.sort_col == "size":
-            key_fn = lambda it: self._to_size_bytes(it.size)
+            def key_fn(it: TorrentItem) -> int:
+                return self._to_size_bytes(it.size)
         elif self.sort_col == "seed":
-            key_fn = lambda it: self._to_int(it.seeders)
+            def key_fn(it: TorrentItem) -> int:
+                return self._to_int(it.seeders)
         elif self.sort_col == "leech":
-            key_fn = lambda it: self._to_int(it.leechers)
+            def key_fn(it: TorrentItem) -> int:
+                return self._to_int(it.leechers)
         elif self.sort_col == "dl":
-            key_fn = lambda it: self._to_int(it.downloads)
+            def key_fn(it: TorrentItem) -> int:
+                return self._to_int(it.downloads)
         elif self.sort_col == "done":
-            key_fn = lambda it: 1 if it.downloaded == "Yes" else 0
+            def key_fn(it: TorrentItem) -> int:
+                return 1 if it.downloaded == "Yes" else 0
         else:
-            key_fn = lambda it: it.idx
+            def key_fn(it: TorrentItem) -> int:
+                return it.idx
         return sorted(items, key=key_fn, reverse=self.sort_desc)
 
     def clear_filter(self) -> None:
@@ -378,6 +445,9 @@ class App:
         self._start_load_feed(refresh_all=True, clear_cache=True)
 
     def _start_load_feed(self, refresh_all: bool, clear_cache: bool) -> None:
+        if self.is_loading:
+            messagebox.showinfo("Info", "A feed is already loading. Please wait for it to finish.")
+            return
         url = self.url_var.get().strip()
         if not url:
             messagebox.showerror("Error", "Please enter feed URL.")
@@ -399,15 +469,29 @@ class App:
 
         self.current_limit = limit
         self._save_settings()
+        self.set_loading(True)
         if clear_cache:
             self.set_status("Clearing cache and loading feed...")
         elif refresh_all:
             self.set_status("Force refreshing feed...")
         else:
             self.set_status("Loading feed...")
-        threading.Thread(target=self._load_feed_worker, args=(url, limit, pages, refresh_all, clear_cache), daemon=True).start()
+        out_dir = self._current_output_dir()
+        threading.Thread(
+            target=self._load_feed_worker,
+            args=(url, limit, pages, refresh_all, clear_cache, out_dir),
+            daemon=True,
+        ).start()
 
-    def _load_feed_worker(self, url: str, limit: int, pages: int, refresh_all: bool, clear_cache: bool) -> None:
+    def _load_feed_worker(
+        self,
+        url: str,
+        limit: int,
+        pages: int,
+        refresh_all: bool,
+        clear_cache: bool,
+        out_dir: str,
+    ) -> None:
         try:
             if clear_cache:
                 normalized_html_url = normalize_url(url)
@@ -416,21 +500,11 @@ class App:
                 removed += clear_source_cache(normalized_url=normalized_feed_url, source_kind="feed")
                 self.root.after(0, lambda: self.set_status(f"Cleared {removed} cache entries, loading..."))
 
-            if looks_like_feed_url(url):
-                try:
-                    items, pages_loaded, normalized = load_items_from_feed(url, pages, refresh_all=refresh_all)
-                except Exception:
-                    items, pages_loaded, normalized = load_items_from_html(url, pages, refresh_all=refresh_all)
-            else:
-                try:
-                    items, pages_loaded, normalized = load_items_from_html(url, pages, refresh_all=refresh_all)
-                except Exception:
-                    items, pages_loaded, normalized = load_items_from_feed(url, pages, refresh_all=refresh_all)
+            items, pages_loaded, normalized = load_items_auto(url, pages, refresh_all=refresh_all)
 
             if not items:
                 raise ValueError("No torrent items found in this feed.")
 
-            out_dir = self._current_output_dir()
             self.history_keys = load_download_history(out_dir)
             mark_downloaded(items, out_dir, self.history_keys)
             self.items = items
@@ -452,8 +526,11 @@ class App:
             self.root.after(0, lambda: messagebox.showerror("Load failed", msg))
             self.root.after(0, lambda: self.set_status("Load failed"))
         except Exception as e:  # noqa: BLE001
-            self.root.after(0, lambda: messagebox.showerror("Load failed", str(e)))
+            error_text = str(e)
+            self.root.after(0, lambda msg=error_text: messagebox.showerror("Load failed", msg))
             self.root.after(0, lambda: self.set_status("Load failed"))
+        finally:
+            self.root.after(0, lambda: self.set_loading(False))
 
     def select_all(self) -> None:
         iids = self.tree.get_children()
@@ -465,6 +542,35 @@ class App:
         self.tree.selection_remove(self.tree.selection())
         self.update_selected_count()
         self.set_status("Selection cleared")
+
+    def copy_selected_names(self) -> None:
+        selected_iids = list(self.tree.selection())
+        selected_names = [
+            self.item_by_iid[iid].name
+            for iid in selected_iids
+            if iid in self.item_by_iid
+        ]
+        if not selected_names:
+            messagebox.showinfo("Info", "Please select at least one item.")
+            return
+        text = "\n".join(selected_names)
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self.root.update()
+        self.set_status(f"Copied {len(selected_names)} name(s)")
+
+    def open_output_folder(self) -> None:
+        out_dir = self._current_output_dir()
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+            if os.name == "nt":
+                os.startfile(out_dir)
+            else:
+                subprocess.Popen(["xdg-open", out_dir])
+            self.set_status("Opened output folder")
+        except Exception as e:  # noqa: BLE001
+            messagebox.showerror("Error", f"Cannot open output folder:\n{out_dir}\n\n{e}")
+            self.set_status("Open output folder failed")
 
     def download_selected(self) -> None:
         selected_iids = list(self.tree.selection())
@@ -509,12 +615,21 @@ class App:
 
             self.root.after(0, lambda i=i, total=total: self.set_progress((i / total) * 100.0))
 
-        msg = f"Done. success={ok}, failed={fail}"
-        save_download_history(out_dir, self.history_keys)
-        self.root.after(0, self.apply_filter_and_refresh)
-        self.root.after(0, lambda: self.set_status(msg))
-        self.root.after(0, lambda: self.set_progress(100.0))
-        self.root.after(0, lambda: self.set_downloading(False))
+        history_error: str | None = None
+        try:
+            save_download_history(out_dir, self.history_keys)
+        except Exception as e:  # noqa: BLE001
+            history_error = str(e)
+            fail += 1
+            errors.append(f"Failed to save download history: {e}")
+        finally:
+            msg = f"Done. success={ok}, failed={fail}"
+            if history_error:
+                msg += " (history save failed)"
+            self.root.after(0, self.apply_filter_and_refresh)
+            self.root.after(0, lambda: self.set_status(msg))
+            self.root.after(0, lambda: self.set_progress(100.0))
+            self.root.after(0, lambda: self.set_downloading(False))
 
         if errors:
             details = "\n".join(errors[:8])
@@ -537,3 +652,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

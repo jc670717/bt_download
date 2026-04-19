@@ -10,7 +10,18 @@ if (-not (Test-Path "torrent_batch_gui.py")) {
 if (Test-Path "build") { Remove-Item -Recurse -Force "build" }
 if (Test-Path "dist") { Remove-Item -Recurse -Force "dist" }
 
-pyinstaller `
+$pythonExe = $null
+if (Get-Command py -ErrorAction SilentlyContinue) {
+  $pythonExe = "py"
+  $pythonArgs = @("-3", "-m", "PyInstaller")
+} elseif (Get-Command python -ErrorAction SilentlyContinue) {
+  $pythonExe = "python"
+  $pythonArgs = @("-m", "PyInstaller")
+} else {
+  throw "Python launcher not found. Install Python 3 or use GitHub Actions build."
+}
+
+& $pythonExe @pythonArgs `
   --noconfirm `
   --clean `
   --onefile `
