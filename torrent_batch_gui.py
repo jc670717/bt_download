@@ -27,9 +27,11 @@ from torrent_batch_cli import (
 )
 
 DEFAULT_FEED_URL = "https://sukebei.nyaa.si/"
-DEFAULT_LIMIT = "5000"
+DEFAULT_LIMIT = "30000"
 DEFAULT_PAGES = "50"
 MAX_RECENT_KEYWORDS = 28
+LARGE_SIZE_BYTES = 3 * 1024**3
+FILTER_MODES = ("All", "Downloaded", "Not Downloaded", "Hide Large Size")
 
 
 class App:
@@ -43,7 +45,7 @@ class App:
         self.item_by_iid: dict[str, TorrentItem] = {}
         self.sort_col = "idx"
         self.sort_desc = False
-        self.current_limit = 1000
+        self.current_limit = int(DEFAULT_LIMIT)
         self.history_keys: set[str] = set()
         self.recent_keywords: list[str] = []
         self.is_loading = False
@@ -53,7 +55,8 @@ class App:
         self.limit_var = tk.StringVar(value=DEFAULT_LIMIT)
         self.pages_var = tk.StringVar(value=DEFAULT_PAGES)
         self.search_var = tk.StringVar(value="")
-        self.show_downloaded_only_var = tk.BooleanVar(value=False)
+        self.filter_mode_var = tk.StringVar(value=FILTER_MODES[0])
+        self.redownload_var = tk.BooleanVar(value=False)
         self.selected_count_var = tk.StringVar(value="Selected: 0")
         self.status_var = tk.StringVar(value="Ready")
         self.progress_var = tk.DoubleVar(value=0.0)
@@ -184,12 +187,18 @@ class App:
         self.force_refresh_btn.grid(row=0, column=6, sticky="ew", padx=(8, 0))
         self.clear_cache_btn = ttk.Button(top, text="Clear Cache", command=self.clear_feed_cache)
         self.clear_cache_btn.grid(row=0, column=7, sticky="ew", padx=(8, 0))
-        ttk.Checkbutton(
-            top,
-            text="Show Downloaded Only",
-            variable=self.show_downloaded_only_var,
-            command=self.apply_filter_and_refresh,
-        ).grid(row=1, column=6, columnspan=2, sticky="w", padx=(8, 0), pady=(8, 0))
+        filter_mode = ttk.Frame(top)
+        filter_mode.grid(row=1, column=6, columnspan=2, sticky="e", padx=(8, 0), pady=(8, 0))
+        ttk.Label(filter_mode, text="Show").grid(row=0, column=0, sticky="w")
+        filter_mode_combo = ttk.Combobox(
+            filter_mode,
+            textvariable=self.filter_mode_var,
+            values=FILTER_MODES,
+            width=17,
+            state="readonly",
+        )
+        filter_mode_combo.grid(row=0, column=1, sticky="ew", padx=(6, 0))
+        filter_mode_combo.bind("<<ComboboxSelected>>", lambda _e: self.apply_filter_and_refresh())
 
         ttk.Label(top, text="Output").grid(row=1, column=0, sticky="w", pady=(8, 0))
         ttk.Entry(top, textvariable=self.out_var, width=95).grid(row=1, column=1, columnspan=3, sticky="ew", padx=(8, 8), pady=(8, 0))
@@ -198,7 +207,7 @@ class App:
         right = ttk.Frame(top)
         right.grid(row=1, column=5, sticky="e", pady=(8, 0))
         ttk.Label(right, text="Limit").grid(row=0, column=0, sticky="w")
-        ttk.Entry(right, textvariable=self.limit_var, width=6).grid(row=0, column=1, padx=(6, 10))
+        ttk.Entry(right, textvariable=self.limit_var, width=7).grid(row=0, column=1, padx=(6, 10))
         ttk.Label(right, text="Pages").grid(row=0, column=2, sticky="w")
         ttk.Entry(right, textvariable=self.pages_var, width=6).grid(row=0, column=3, padx=(6, 0))
 
@@ -257,10 +266,12 @@ class App:
         self.progress.pack(fill=tk.X, pady=(0, 10))
 
         ttk.Button(bottom, text="Select All", command=self.select_all).pack(side=tk.LEFT)
+        ttk.Button(bottom, text="Select Not Downloaded", command=self.select_not_downloaded).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Button(bottom, text="Clear Selection", command=self.clear_selection).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Label(bottom, textvariable=self.selected_count_var).pack(side=tk.LEFT, padx=(12, 0))
         self.download_btn = ttk.Button(bottom, text="Download Selected", command=self.download_selected)
         self.download_btn.pack(side=tk.RIGHT)
+        ttk.Checkbutton(bottom, text="Re-Download", variable=self.redownload_var).pack(side=tk.RIGHT, padx=(0, 8))
         ttk.Label(bottom, textvariable=self.status_var).pack(side=tk.LEFT, padx=(12, 0))
 
         self._refresh_keyword_buttons()
@@ -357,6 +368,9 @@ class App:
         }
         return int(num * scale.get(unit, 1))
 
+    def _is_large_item(self, item: TorrentItem) -> bool:
+        return self._to_size_bytes(item.size) > LARGE_SIZE_BYTES
+
     def _sorted_items(self, items: list[TorrentItem]) -> list[TorrentItem]:
         if self.sort_col == "name":
             def key_fn(it: TorrentItem) -> str:
@@ -390,15 +404,19 @@ class App:
 
     def apply_filter_and_refresh(self) -> None:
         q = self.search_var.get().strip().lower()
+        mode = self.filter_mode_var.get()
         base = self.items
-        if self.show_downloaded_only_var.get():
+        if mode == "Downloaded":
             base = [it for it in base if it.downloaded == "Yes"]
+        elif mode == "Not Downloaded":
+            base = [it for it in base if it.downloaded != "Yes"]
+        elif mode == "Hide Large Size":
+            base = [it for it in base if not self._is_large_item(it)]
         if q:
             base = [
                 it
-                for it in self.items
-                if (not self.show_downloaded_only_var.get() or it.downloaded == "Yes")
-                and (q in it.name.lower() or q in it.date.lower() or q in it.downloaded.lower())
+                for it in base
+                if q in it.name.lower() or q in it.date.lower() or q in it.downloaded.lower()
             ]
         self.filtered_items = self._sorted_items(base)
         self.populate_table(self.filtered_items, self.current_limit, preserve_status=True)
@@ -416,7 +434,7 @@ class App:
         shown = items[: max(1, limit)]
         for it in shown:
             iid = str(it.idx)
-            warn = self._to_size_bytes(it.size) > 3 * 1024**3
+            warn = self._is_large_item(it)
             if it.downloaded == "Yes":
                 tags = ("downloaded",)
             elif warn:
@@ -538,6 +556,16 @@ class App:
         self.update_selected_count()
         self.set_status(f"Selected {len(iids)} item(s)")
 
+    def select_not_downloaded(self) -> None:
+        iids = [
+            iid
+            for iid in self.tree.get_children()
+            if iid in self.item_by_iid and self.item_by_iid[iid].downloaded != "Yes"
+        ]
+        self.tree.selection_set(iids)
+        self.update_selected_count()
+        self.set_status(f"Selected {len(iids)} not downloaded item(s)")
+
     def clear_selection(self) -> None:
         self.tree.selection_remove(self.tree.selection())
         self.update_selected_count()
@@ -588,8 +616,22 @@ class App:
         if not self.history_keys:
             self.history_keys = load_download_history(out_dir)
 
-        selected = [self.item_by_iid[iid] for iid in selected_iids if iid in self.item_by_iid]
-        self.set_status(f"Downloading {len(selected)} item(s)...")
+        selected_items = [self.item_by_iid[iid] for iid in selected_iids if iid in self.item_by_iid]
+        if self.redownload_var.get():
+            selected = selected_items
+            status = f"Re-downloading {len(selected)} item(s)..."
+        else:
+            selected = [it for it in selected_items if it.downloaded != "Yes"]
+            skipped = len(selected_items) - len(selected)
+            if not selected:
+                self.set_status(f"Skipped {skipped} already downloaded item(s)")
+                messagebox.showinfo("Info", "All selected items are already downloaded.")
+                return
+
+            status = f"Downloading {len(selected)} item(s)..."
+            if skipped:
+                status += f" skipped {skipped} already downloaded"
+        self.set_status(status)
         self.set_progress(0)
         self.set_downloading(True)
         threading.Thread(target=self._download_worker, args=(selected, out_dir), daemon=True).start()
