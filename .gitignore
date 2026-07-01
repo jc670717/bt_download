@@ -4,3 +4,7 @@ __pycache__/
 app_settings.json
 download_history.json
 source_cache.json
+build/
+dist/
+TorrentBatchDownloader.spec
+TorrentBatchDownloader.exe
