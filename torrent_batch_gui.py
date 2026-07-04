@@ -6,6 +6,7 @@ import os
 import re
 import subprocess
 import threading
+from collections import deque
 import tkinter as tk
 import urllib.error
 from tkinter import filedialog, messagebox, ttk
@@ -38,7 +39,7 @@ class App:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("Torrent Batch Downloader")
-        self.root.geometry("1520x760")
+        self.root.geometry("1520x960")
 
         self.items: list[TorrentItem] = []
         self.filtered_items: list[TorrentItem] = []
@@ -49,6 +50,13 @@ class App:
         self.history_keys: set[str] = set()
         self.recent_keywords: list[str] = []
         self.is_loading = False
+        self.download_queue: deque[TorrentItem] = deque()
+        self.download_lock = threading.Lock()
+        self.download_worker_running = False
+        self.queue_session_ok = 0
+        self.queue_session_fail = 0
+        self.queue_session_errors: list[str] = []
+        self.selection_anchor_iid: str | None = None
 
         self.url_var = tk.StringVar(value=DEFAULT_FEED_URL)
         self.out_var = tk.StringVar(value=self._default_output_dir())
@@ -60,6 +68,7 @@ class App:
         self.selected_count_var = tk.StringVar(value="Selected: 0")
         self.status_var = tk.StringVar(value="Ready")
         self.progress_var = tk.DoubleVar(value=0.0)
+        self.queue_var = tk.StringVar(value="Queue: empty")
 
         self._load_settings()
         self._build_ui()
@@ -250,6 +259,7 @@ class App:
         self.tree.column("done", width=95, anchor="center")
         self.tree.tag_configure("warn", foreground="#cc0000")
         self.tree.tag_configure("downloaded", foreground="#0057cc")
+        self.tree.bind("<Button-1>", self._handle_tree_click, add=True)
         self.tree.bind("<<TreeviewSelect>>", lambda _e: self.update_selected_count())
 
         y_scroll = ttk.Scrollbar(mid, orient=tk.VERTICAL, command=self.tree.yview)
@@ -273,6 +283,12 @@ class App:
         self.download_btn.pack(side=tk.RIGHT)
         ttk.Checkbutton(bottom, text="Re-Download", variable=self.redownload_var).pack(side=tk.RIGHT, padx=(0, 8))
         ttk.Label(bottom, textvariable=self.status_var).pack(side=tk.LEFT, padx=(12, 0))
+
+        queue = ttk.Frame(self.root, padding=(10, 0, 10, 10))
+        queue.pack(fill=tk.BOTH, expand=False)
+        ttk.Label(queue, textvariable=self.queue_var).pack(anchor="w")
+        self.queue_listbox = tk.Listbox(queue, height=6, exportselection=False)
+        self.queue_listbox.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
 
         self._refresh_keyword_buttons()
 
@@ -303,11 +319,12 @@ class App:
                 mark_downloaded(self.items, self._current_output_dir(), self.history_keys)
                 self.apply_filter_and_refresh()
 
-    def clear_table(self) -> None:
+    def clear_table(self, preserve_selection: set[str] | None = None) -> None:
         for iid in self.tree.get_children():
             self.tree.delete(iid)
         self.item_by_iid.clear()
-        self.update_selected_count()
+        if preserve_selection is None:
+            self.update_selected_count()
 
     def _refresh_keyword_buttons(self) -> None:
         for child in self.keyword_frame.winfo_children():
@@ -330,6 +347,57 @@ class App:
 
     def update_selected_count(self) -> None:
         self.selected_count_var.set(f"Selected: {len(self.tree.selection())}")
+
+    def _handle_tree_click(self, event: tk.Event) -> str | None:
+        row_iid = self.tree.identify_row(event.y)
+        if not row_iid:
+            return None
+
+        ctrl = bool(event.state & 0x0004)
+        shift = bool(event.state & 0x0001)
+        current = set(self.tree.selection())
+        items = list(self.tree.get_children())
+
+        if self.selection_anchor_iid not in items:
+            self.selection_anchor_iid = row_iid
+
+        if ctrl and shift and self.selection_anchor_iid in items:
+            start = items.index(self.selection_anchor_iid)
+            end = items.index(row_iid)
+            lo, hi = sorted((start, end))
+            current.update(items[lo : hi + 1])
+            self.tree.selection_set(list(current))
+            return "break"
+
+        if shift and self.selection_anchor_iid in items:
+            start = items.index(self.selection_anchor_iid)
+            end = items.index(row_iid)
+            lo, hi = sorted((start, end))
+            self.tree.selection_set(items[lo : hi + 1])
+            return "break"
+
+        if ctrl:
+            if row_iid in current:
+                current.remove(row_iid)
+                self.tree.selection_set(list(current))
+            else:
+                self.tree.selection_add(row_iid)
+            self.selection_anchor_iid = row_iid
+            return "break"
+
+        self.selection_anchor_iid = row_iid
+        return None
+
+    def _refresh_queue_listbox(self) -> None:
+        items = list(self.download_queue)
+        self.queue_listbox.delete(0, tk.END)
+        for it in items:
+            line = f"#{it.idx} | {it.name} | {it.date} | {it.size} | S:{it.seeders} | L:{it.leechers} | D:{it.downloads}"
+            self.queue_listbox.insert(tk.END, line)
+        if items:
+            self.queue_var.set(f"Queue: {len(items)} item(s)")
+        else:
+            self.queue_var.set("Queue: empty")
 
     def apply_filter_keyword(self, _event: tk.Event | None = None) -> str | None:
         keyword = self.search_var.get().strip()
@@ -430,7 +498,8 @@ class App:
         self.apply_filter_and_refresh()
 
     def populate_table(self, items: list[TorrentItem], limit: int, preserve_status: bool = False) -> None:
-        self.clear_table()
+        selected_before = set(self.tree.selection())
+        self.clear_table(preserve_selection=selected_before)
         shown = items[: max(1, limit)]
         for it in shown:
             iid = str(it.idx)
@@ -449,6 +518,11 @@ class App:
                 tags=tags,
             )
             self.item_by_iid[iid] = it
+        if selected_before:
+            restored = [iid for iid in selected_before if iid in self.item_by_iid]
+            if restored:
+                self.tree.selection_set(restored)
+                self.selection_anchor_iid = restored[-1]
         self.update_selected_count()
         if not preserve_status:
             self.set_status(f"Loaded {len(shown)} item(s)")
@@ -568,6 +642,7 @@ class App:
 
     def clear_selection(self) -> None:
         self.tree.selection_remove(self.tree.selection())
+        self.selection_anchor_iid = None
         self.update_selected_count()
         self.set_status("Selection cleared")
 
@@ -632,46 +707,62 @@ class App:
             if skipped:
                 status += f" skipped {skipped} already downloaded"
         self.set_status(status)
-        self.set_progress(0)
-        self.set_downloading(True)
-        threading.Thread(target=self._download_worker, args=(selected, out_dir), daemon=True).start()
+        with self.download_lock:
+            for it in selected:
+                self.download_queue.append(it)
+            self._refresh_queue_listbox()
+            if not self.download_worker_running:
+                self.download_worker_running = True
+                threading.Thread(target=self._download_worker, args=(out_dir,), daemon=True).start()
 
-    def _download_worker(self, selected: list[TorrentItem], out_dir: str) -> None:
-        ok = 0
-        fail = 0
-        errors: list[str] = []
-        total = len(selected)
+    def _download_worker(self, out_dir: str) -> None:
+        while True:
+            with self.download_lock:
+                if not self.download_queue:
+                    self.download_worker_running = False
+                    break
+                it = self.download_queue.popleft()
+                queue_len = len(self.download_queue)
+                self.root.after(0, self._refresh_queue_listbox)
 
-        for i, it in enumerate(selected, start=1):
-            self.root.after(0, lambda i=i, total=total, it=it: self.set_status(f"Downloading {i}/{total}: {it.name}"))
             out_path = os.path.join(out_dir, f"{sanitize_filename(it.name)}.torrent")
+            self.root.after(0, lambda it=it, queue_len=queue_len: self.set_status(f"Downloading: {it.name} ({queue_len} left in queue)"))
 
             try:
                 download_file(it.torrent_url, out_path)
                 it.downloaded = "Yes"
                 self.history_keys.add(item_history_key(it))
-                ok += 1
+                with self.download_lock:
+                    self.queue_session_ok += 1
             except Exception as e:  # noqa: BLE001
-                fail += 1
-                errors.append(f"#{it.idx} {it.name}: {e}")
+                with self.download_lock:
+                    self.queue_session_fail += 1
+                    self.queue_session_errors.append(f"#{it.idx} {it.name}: {e}")
 
-            self.root.after(0, lambda i=i, total=total: self.set_progress((i / total) * 100.0))
+            self.root.after(0, self.apply_filter_and_refresh)
 
         history_error: str | None = None
         try:
             save_download_history(out_dir, self.history_keys)
         except Exception as e:  # noqa: BLE001
             history_error = str(e)
-            fail += 1
-            errors.append(f"Failed to save download history: {e}")
+            with self.download_lock:
+                self.queue_session_fail += 1
+                self.queue_session_errors.append(f"Failed to save download history: {e}")
         finally:
+            with self.download_lock:
+                ok = self.queue_session_ok
+                fail = self.queue_session_fail
+                errors = list(self.queue_session_errors)
+                self.queue_session_ok = 0
+                self.queue_session_fail = 0
+                self.queue_session_errors.clear()
             msg = f"Done. success={ok}, failed={fail}"
             if history_error:
                 msg += " (history save failed)"
-            self.root.after(0, self.apply_filter_and_refresh)
+            self.root.after(0, self._refresh_queue_listbox)
             self.root.after(0, lambda: self.set_status(msg))
             self.root.after(0, lambda: self.set_progress(100.0))
-            self.root.after(0, lambda: self.set_downloading(False))
 
         if errors:
             details = "\n".join(errors[:8])
